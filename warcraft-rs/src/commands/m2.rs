@@ -124,6 +124,13 @@ pub enum M2Commands {
         #[arg(short, long)]
         detailed: bool,
     },
+
+    /// Scan current directory recursively for .m2 files and extract BLP paths
+    ScanBlpPaths {
+        /// Output text file path (default: m2_blp_paths.txt in current dir)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 pub fn execute(cmd: M2Commands) -> Result<()> {
@@ -164,6 +171,7 @@ pub fn execute(cmd: M2Commands) -> Result<()> {
             version,
         } => handle_anim_convert(input, output, version),
         M2Commands::BlpInfo { file, detailed } => handle_blp_info(file, detailed),
+        M2Commands::ScanBlpPaths { output } => handle_scan_blp_paths(output),
     }
 }
 
@@ -866,5 +874,36 @@ fn handle_blp_info(path: PathBuf, detailed: bool) -> Result<()> {
         println!("(Detailed information requires additional public API methods)");
     }
 
+    Ok(())
+}
+
+fn handle_scan_blp_paths(output: Option<PathBuf>) -> Result<()> {
+    let pattern = "**/*.m2";
+    let mut paths: Vec<String> = Vec::new();
+
+    for entry in glob::glob(pattern).map_err(|e| anyhow::anyhow!(e.msg))? {
+        match entry {
+            Ok(path) => {
+                let m2 = M2Model::load(&path).with_context(|| format!("Failed to load M2: {}", path.display()))?;
+                let model = m2.model();
+                for tex in &model.textures {
+                    let filename = tex.filename.string.to_string_lossy();
+                    if !filename.is_empty() {
+                        paths.push(filename.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                // Skip unreadable entries
+                log::warn!("Glob entry error: {}", e);
+            }
+        }
+    }
+
+    let out_path = output.unwrap_or_else(|| PathBuf::from("m2_blp_paths.txt"));
+    let content = paths.join("\n");
+    std::fs::write(&out_path, content).with_context(|| format!("Failed to write output file: {}", out_path.display()))?;
+
+    println!("已写入 {} 条 BLP 路径到 {}", paths.len(), out_path.display());
     Ok(())
 }
