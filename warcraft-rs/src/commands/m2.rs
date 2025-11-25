@@ -256,6 +256,27 @@ fn handle_info(path: PathBuf, detailed: bool) -> Result<()> {
         // Model flags
         println!("\n--- Model Flags ---");
         println!("Flags: {:?}", model.header.flags);
+
+        // Texture information
+        if !model.textures.is_empty() {
+            println!("\n--- Textures ---");
+            for (i, texture) in model.textures.iter().enumerate() {
+                let filename = texture.filename.string.to_string_lossy();
+                let type_name = format!("{:?}", texture.texture_type);
+                let flags = format!("{:?}", texture.flags);
+                if filename.is_empty() {
+                    println!(
+                        "  [{}] Type: {}, Flags: {} (runtime texture)",
+                        i, type_name, flags
+                    );
+                } else {
+                    println!(
+                        "  [{}] Type: {}, Flags: {}\n      Path: {}",
+                        i, type_name, flags, filename
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
