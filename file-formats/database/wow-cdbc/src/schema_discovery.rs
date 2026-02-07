@@ -28,6 +28,11 @@ pub struct DiscoveredField {
     pub is_array: bool,
     /// Size of the array, if the field is an array
     pub array_size: Option<usize>,
+    /// Whether this field is part of a localized string (locstring)
+    /// Classic WoW locstrings have 8 string refs (one per locale) + 1 flags field
+    pub is_locstring: bool,
+    /// Locale index within a locstring (0-7 for string refs, 8 for flags field)
+    pub locstring_index: Option<u8>,
     /// Sample values (for validation and debugging)
     pub sample_values: Vec<u32>,
 }
@@ -205,6 +210,10 @@ impl<'a> SchemaDiscoverer<'a> {
             discovered_fields.push(discovered_field);
         }
 
+        // Detect localized strings (locstrings) - 8 string refs + 1 flags field
+        // This must run before array detection to properly classify fields
+        self.detect_locstrings(&mut discovered_fields);
+
         // Detect arrays if configured
         if self.detect_arrays {
             self.detect_array_fields(&mut discovered_fields);
@@ -228,16 +237,24 @@ impl<'a> SchemaDiscoverer<'a> {
 
         // Validate string references if configured
         let is_valid_string_ref = if self.validate_strings && is_string_ref {
-            // Check if the string references point to valid strings
+            // Check if the string references point to the START of valid strings
+            // This eliminates false positives where integer values happen to fall
+            // within the string block range but don't point to actual string starts
             let valid_strings = values
                 .iter()
                 .filter(|&&value| {
                     if value == 0 {
-                        // Empty string is valid
+                        // Empty string (offset 0) is valid
                         return true;
                     }
 
-                    // Check if the value points to a valid string
+                    // Check if the value points to the start of a string
+                    // A string start is at offset 0 or immediately after a NUL byte
+                    if !self.string_block.is_string_start(value) {
+                        return false;
+                    }
+
+                    // Also verify the string at that offset is valid UTF-8
                     self.string_block.get_string(StringRef::new(value)).is_ok()
                 })
                 .count();
@@ -250,39 +267,55 @@ impl<'a> SchemaDiscoverer<'a> {
         // Check for potential key field
         let is_key_candidate = self.is_potential_key(values);
 
-        // Check if the values fit in different integer ranges
-        let min_value = values.iter().copied().min().unwrap_or(0);
-        let max_value = values.iter().copied().max().unwrap_or(0);
+        // Check if the values could be floating point using better heuristics
+        // Key insight: small integers (0-65535) as u32 reinterpret as tiny denormals
+        // when viewed as f32, while actual floats like 1.0f32 have u32 value 0x3F800000
+        let is_float_like = |value: u32| -> bool {
+            // Small integers (< 65536) are almost never stored as floats
+            // because float 1.0 = 0x3F800000 = 1065353216, not 1
+            // A u32 of 100 reinterpreted as float is ~1.4e-43 (denormal)
+            if value < 65536 {
+                return false;
+            }
 
-        let fits_uint8 = max_value <= 0xFF;
-        let fits_int8 = min_value >= 0x80 && max_value <= 0x7F;
-        let fits_uint16 = max_value <= 0xFFFF;
-        let fits_int16 = min_value >= 0x8000 && max_value <= 0x7FFF;
-
-        // Check if the values could be floating point
-        let could_be_float = values.iter().any(|&value| {
-            // Check if the bit pattern could represent a reasonable float
             let float_val = f32::from_bits(value);
-            float_val.is_finite()
-                && !float_val.is_subnormal()
-                && (float_val.abs() < 0.00001 || float_val.abs() > 0.00001)
-        });
+
+            // Must be finite and not subnormal
+            if !float_val.is_finite() || float_val.is_subnormal() {
+                return false;
+            }
+
+            // Check if float is in reasonable game data range
+            // Most game floats are: normalized (0-1), percentages (0-100),
+            // coordinates (-10000 to 10000), scales (0.001 to 1000)
+            let abs_val = float_val.abs();
+            (1e-6..=1e7).contains(&abs_val)
+        };
+
+        // Count non-zero values and how many look like floats
+        let non_zero_values: Vec<u32> = values.iter().copied().filter(|&v| v != 0).collect();
+        let float_like_count = non_zero_values
+            .iter()
+            .filter(|&&v| is_float_like(v))
+            .count();
+
+        // Require majority (>= 75%) of non-zero values to look like floats
+        // Also require at least one float-like value (handles edge case where
+        // integer division of small counts could yield 0)
+        let could_be_float =
+            float_like_count > 0 && float_like_count >= (non_zero_values.len() * 3 / 4).max(1);
 
         // Determine the most likely field type
+        // NOTE: DBC files always store 4 bytes per field, so we only detect 4-byte types.
+        // Smaller types (UInt8, Int8, UInt16, Int16) are not used because they would
+        // cause incorrect size calculations during schema validation.
         let (field_type, confidence) = if is_valid_string_ref {
             (FieldType::String, Confidence::High)
-        } else if is_string_ref {
+        } else if is_string_ref && !self.validate_strings {
+            // Only use unvalidated string detection when validation is disabled
             (FieldType::String, Confidence::Medium)
         } else if is_bool {
             (FieldType::Bool, Confidence::High)
-        } else if fits_uint8 {
-            (FieldType::UInt8, Confidence::Medium)
-        } else if fits_int8 {
-            (FieldType::Int8, Confidence::Medium)
-        } else if fits_uint16 {
-            (FieldType::UInt16, Confidence::Medium)
-        } else if fits_int16 {
-            (FieldType::Int16, Confidence::Medium)
         } else if could_be_float {
             (FieldType::Float32, Confidence::Medium)
         } else if values.iter().any(|&v| v > 0x7FFFFFFF) {
@@ -300,8 +333,10 @@ impl<'a> SchemaDiscoverer<'a> {
             field_type,
             confidence,
             is_key_candidate,
-            is_array: false,  // Will be set later if detected
-            array_size: None, // Will be set later if detected
+            is_array: false,       // Will be set later if detected
+            array_size: None,      // Will be set later if detected
+            is_locstring: false,   // Will be set later if detected
+            locstring_index: None, // Will be set later if detected
             sample_values,
         })
     }
@@ -348,7 +383,7 @@ impl<'a> SchemaDiscoverer<'a> {
         // Look for repeating patterns of field types
         for array_size in 2..=10 {
             // Try different array sizes
-            if fields.len() % array_size != 0 {
+            if !fields.len().is_multiple_of(array_size) {
                 continue; // Fields must divide evenly by array size
             }
 
@@ -385,6 +420,87 @@ impl<'a> SchemaDiscoverer<'a> {
                 *fields = new_fields;
                 return; // Successfully detected arrays
             }
+        }
+    }
+
+    /// Detect localized string (locstring) patterns in fields
+    ///
+    /// Classic WoW locstrings consist of 9 consecutive fields:
+    /// - 8 string references (one per locale: enUS, koKR, frFR, deDE, zhCN, zhTW, esES, esMX)
+    /// - 1 flags field (u32)
+    ///
+    /// In non-English clients or files, most locale fields are empty (offset 0),
+    /// which causes them to be detected as Bool. This method identifies this pattern
+    /// and reclassifies those fields as String.
+    fn detect_locstrings(&self, fields: &mut [DiscoveredField]) {
+        // Need at least 9 fields for a locstring
+        if fields.len() < 9 {
+            return;
+        }
+
+        let mut i = 0;
+        while i + 8 < fields.len() {
+            // Look for a String field with High confidence as the start
+            if fields[i].field_type != FieldType::String || fields[i].confidence != Confidence::High
+            {
+                i += 1;
+                continue;
+            }
+
+            // Check if the next 7 fields are either String or "faux Bool" (all zeros)
+            let mut is_locstring_pattern = true;
+            for j in 1..8 {
+                let field = &fields[i + j];
+                let is_string = field.field_type == FieldType::String;
+                let is_empty_string_ref = field.field_type == FieldType::Bool
+                    && field.sample_values.iter().all(|&v| v == 0);
+
+                if !is_string && !is_empty_string_ref {
+                    is_locstring_pattern = false;
+                    break;
+                }
+            }
+
+            if !is_locstring_pattern {
+                i += 1;
+                continue;
+            }
+
+            // Check the 9th field - it should be an integer (flags field)
+            // The flags field is typically 0 or a small bitmask
+            let flags_field = &fields[i + 8];
+            let is_valid_flags = matches!(
+                flags_field.field_type,
+                FieldType::Int32 | FieldType::UInt32 | FieldType::Bool
+            );
+
+            if !is_valid_flags {
+                i += 1;
+                continue;
+            }
+
+            // Found a locstring pattern! Mark all 9 fields
+            for j in 0..8 {
+                fields[i + j].is_locstring = true;
+                fields[i + j].locstring_index = Some(j as u8);
+                // Reclassify Bool fields as String (they're empty string refs)
+                if fields[i + j].field_type == FieldType::Bool {
+                    fields[i + j].field_type = FieldType::String;
+                    fields[i + j].confidence = Confidence::Medium;
+                }
+            }
+
+            // Mark the flags field
+            fields[i + 8].is_locstring = true;
+            fields[i + 8].locstring_index = Some(8);
+            // Reclassify Bool as Int32 for the flags field
+            if fields[i + 8].field_type == FieldType::Bool {
+                fields[i + 8].field_type = FieldType::Int32;
+                fields[i + 8].confidence = Confidence::Medium;
+            }
+
+            // Skip past this locstring
+            i += 9;
         }
     }
 

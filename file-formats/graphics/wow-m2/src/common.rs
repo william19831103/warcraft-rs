@@ -182,8 +182,31 @@ where
     Ok(result)
 }
 
+/// Reads raw bytes from an M2Array reference, preserving data for sections we don't fully parse
+pub fn read_raw_bytes<R: Read + Seek>(
+    reader: &mut R,
+    array: &M2Array<u32>,
+    element_size: usize,
+) -> Result<Vec<u8>> {
+    if array.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Seek to the array data
+    reader
+        .seek(std::io::SeekFrom::Start(array.offset as u64))
+        .map_err(M2Error::Io)?;
+
+    // Read raw bytes
+    let total_bytes = array.count as usize * element_size;
+    let mut data = vec![0u8; total_bytes];
+    reader.read_exact(&mut data).map_err(M2Error::Io)?;
+
+    Ok(data)
+}
+
 /// A vector in 3D space
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct C3Vector {
     pub x: f32,
     pub y: f32,
@@ -235,7 +258,7 @@ impl C3Vector {
 }
 
 /// A vector in 2D space
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct C2Vector {
     pub x: f32,
     pub y: f32,

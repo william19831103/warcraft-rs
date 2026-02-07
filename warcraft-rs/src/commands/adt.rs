@@ -6,7 +6,7 @@ use prettytable::{Cell, Row, Table, format};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use wow_adt::{AdtVersion, ParsedAdt, parse_adt_with_metadata};
+use wow_adt::{AdtVersion, BuiltAdt, ParsedAdt, parse_adt_with_metadata};
 
 #[cfg(feature = "parallel")]
 use wow_adt::parse_adt;
@@ -435,8 +435,76 @@ fn execute_validate(file: &str, level: &str, warnings: bool) -> Result<()> {
     Ok(())
 }
 
-fn execute_convert(_input: &str, _output: &str, _to_version: &str) -> Result<()> {
-    anyhow::bail!("ADT conversion not yet implemented for binrw-based API");
+fn execute_convert(input: &str, output: &str, to_version: &str) -> Result<()> {
+    // Parse target version from expansion name
+    let target_version = AdtVersion::from_expansion_name(to_version).with_context(|| {
+        format!(
+            "Invalid target version '{}'. Valid options: classic, tbc, wotlk, cataclysm, mop",
+            to_version
+        )
+    })?;
+
+    println!("ADT Conversion");
+    println!("==============");
+    println!();
+    println!("Input:  {}", input);
+    println!("Output: {}", output);
+    println!("Target: {}", target_version.expansion_name());
+    println!();
+
+    // Parse the input ADT file
+    let file =
+        File::open(input).with_context(|| format!("Failed to open input ADT file: {}", input))?;
+    let mut reader = BufReader::new(file);
+    let (adt, metadata) = parse_adt_with_metadata(&mut reader)
+        .with_context(|| format!("Failed to parse ADT file: {}", input))?;
+
+    // Only root ADT files can be converted for now
+    let root = match adt {
+        ParsedAdt::Root(root) => root,
+        ParsedAdt::Tex0(_) | ParsedAdt::Tex1(_) => {
+            anyhow::bail!(
+                "Cannot convert texture ADT files (_tex0/_tex1). \
+                 Only root ADT files are supported."
+            );
+        }
+        ParsedAdt::Obj0(_) | ParsedAdt::Obj1(_) => {
+            anyhow::bail!(
+                "Cannot convert object ADT files (_obj0/_obj1). \
+                 Only root ADT files are supported."
+            );
+        }
+        ParsedAdt::Lod(_) => {
+            anyhow::bail!(
+                "Cannot convert LOD ADT files (_lod). \
+                 Only root ADT files are supported."
+            );
+        }
+    };
+
+    println!("Source version: {}", metadata.version.expansion_name());
+    println!("MCNK chunks:    {}/256", root.mcnk_chunks.len());
+    println!("Textures:       {}", root.textures.len());
+    println!("M2 models:      {}", root.models.len());
+    println!("WMO objects:    {}", root.wmos.len());
+    println!();
+
+    // Convert RootAdt to BuiltAdt with target version
+    let built = BuiltAdt::from_root_adt(*root, Some(target_version));
+
+    // Write to output file
+    built
+        .write_to_file(output)
+        .with_context(|| format!("Failed to write output ADT file: {}", output))?;
+
+    // Verify output file exists
+    let output_meta = std::fs::metadata(output)
+        .with_context(|| format!("Failed to verify output file: {}", output))?;
+
+    println!("Conversion complete!");
+    println!("Output file size: {} bytes", output_meta.len());
+
+    Ok(())
 }
 
 #[cfg(feature = "extract")]
@@ -579,8 +647,23 @@ fn build_root_adt_tree(
             );
 
             if !no_metadata {
+                // Show world position for first chunk only to avoid clutter
+                if chunk.header.index_x == 0 && chunk.header.index_y == 0 {
+                    let pos = chunk.header.world_position();
+                    chunk_node = chunk_node.with_metadata(
+                        "position",
+                        &format!("[{:.1}, {:.1}, {:.1}]", pos[0], pos[1], pos[2]),
+                    );
+                }
+
                 chunk_node = chunk_node
                     .with_metadata("flags", &format!("0x{:08X}", chunk.header.flags.value));
+
+                if chunk.header.n_layers > 0 {
+                    chunk_node =
+                        chunk_node.with_metadata("layers", &chunk.header.n_layers.to_string());
+                }
+
                 chunk_node = chunk_node.with_metadata(
                     "holes",
                     if chunk.header.holes_low_res != 0 {
@@ -932,7 +1015,7 @@ fn build_root_adt_tree(
 
     if let Some(params) = &adt.texture_params {
         let mut params_node = TreeNode::new(
-            format!("MTXP ({} texture params)", params.height_params.len()),
+            format!("MTXP ({} texture params)", params.entries.len()),
             NodeType::Chunk,
         );
         if !no_metadata {
@@ -1064,7 +1147,7 @@ fn build_tex_adt_tree(
     // Texture parameters
     if let Some(params) = &adt.texture_params {
         let mut params_node = TreeNode::new(
-            format!("MTXP ({} params)", params.height_params.len()),
+            format!("MTXP ({} params)", params.entries.len()),
             NodeType::Chunk,
         );
         if !no_metadata {

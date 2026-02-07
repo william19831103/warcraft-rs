@@ -6,9 +6,201 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 0.5.0
+## [Unreleased]
+
+## [0.6.1] - 2026-01-20
+
+### Fixed
+
+- **CI**: Release CLI workflow now builds Intel macOS binaries correctly
+  - Added explicit `rustup target add` for cross-compilation on ARM macOS runners
+  - Removed unsupported aarch64-pc-windows-msvc target
+
+## [0.6.0] - 2026-01-20
+
+### Fixed
+
+- **M2 Format**: Version conversion roundtrip for all supported versions
+  - Fixed `playable_animation_lookup` field handling for Vanilla (256-263)
+  - Header parse expected this field for Vanilla but write omitted it
+  - Version conversion now works: Vanilla, TBC, WotLK, Cataclysm, MoP
+  - Cross-version conversion validated: WotLK↔Vanilla, WotLK↔Cata, etc.
+- **BLP Convert CLI**: Alpha bits auto-detection from input image
+  - Made `--alpha-bits` optional; auto-detects based on input image color type
+  - DXT1 auto-selects 1-bit alpha for images with transparency, 0 otherwise
+  - DXT3/DXT5/JPEG auto-select 8-bit alpha for images with transparency
+  - Raw1/Raw3 auto-select 8-bit alpha for full quality
+- **BLP Format**: JPEG encoding handles RGBA images
+  - JPEG format stores RGB only; RGBA images now convert to RGB with warning
+  - Previously crashed with "encoder does not support Rgba8 color type"
+  - Alpha channel stripped during JPEG encoding as expected by format
+- **M2 Format**: Skin file bone_indices parsing reads correct byte count
+  - bone_indices is ubyte4 (4 bone indices per vertex), not single bytes
+  - M2Array count represents vertex count; actual data is count × 4 bytes
+  - Previously lost 75% of bone influence data during parsing
+- **M2 Format**: Old skin format includes boneCountMax field
+  - Added missing u32 boneCountMax at end of OldSkinHeader (offset 44)
+  - Header size calculation now includes this field
+  - Cross-format conversion preserves bone count limits
 
 ### Added
+
+- **M2 Format**: Particle emitter animation preservation in roundtrip
+  - Added `ParticleTrackType` enum for 10 animation track types
+  - Added `ParticleAnimationRaw` struct for raw keyframe storage
+  - Particle animation data collected during parse
+  - Animation offsets relocated during write
+  - Handles offset sharing for multiple tracks pointing to same data
+- **M2 Format**: Ribbon emitter animation preservation in roundtrip
+  - Added `RibbonTrackType` enum for 4 animation track types
+  - Added `RibbonAnimationRaw` struct for raw keyframe storage
+  - Ribbon animation data collected during parse
+  - Animation offsets relocated during write
+- **M2 Format**: Texture animation preservation in roundtrip
+  - Added `TextureTrackType` enum for 5 animation track types
+  - Added `TextureAnimationRaw` struct for raw keyframe storage
+  - Texture animation data collected during parse (translation U/V, rotation, scale U/V)
+  - Animation offsets relocated during write
+  - Handles UV scrolling, rotation, and scaling effects
+- **M2 Format**: Color animation preservation in roundtrip
+  - Added `ColorTrackType` enum for 2 animation track types (color RGB, alpha)
+  - Added `ColorAnimationRaw` struct for raw keyframe storage
+  - Color animation data collected during parse
+  - Animation offsets relocated during write
+  - Handles material color and alpha animations
+- **M2 Format**: Transparency animation preservation in roundtrip
+  - Added `TransparencyTrackType` enum for alpha animation track
+  - Added `TransparencyAnimationRaw` struct for raw keyframe storage
+  - Transparency animation data collected during parse
+  - Animation offsets relocated during write
+  - Handles texture weight/opacity animations
+- **M2 Format**: Event track preservation in roundtrip
+  - Added `EventRaw` struct for raw timestamp storage
+  - Events use simple `M2Array<u32>` for timestamps (not M2AnimationBlock)
+  - Event timestamp data collected during parse
+  - Track offsets relocated during write
+  - Handles animation timeline triggers (sounds, effects)
+- **M2 Format**: Attachment animation preservation in roundtrip
+  - Added `AttachmentTrackType` enum for scale animation track
+  - Added `AttachmentAnimationRaw` struct for raw keyframe storage
+  - Attachment animation data collected during parse
+  - Animation offsets relocated during write
+  - Handles attach point scale animations (weapons, effects)
+- **M2 Format**: Camera animation preservation in roundtrip
+  - Added `CameraTrackType` enum for 3 animation track types
+  - Added `CameraAnimationRaw` struct for raw keyframe storage
+  - Camera animation data collected during parse (position, target position, roll)
+  - Animation offsets relocated during write
+  - Handles camera flythrough and cinematic animations
+- **M2 Format**: Light animation preservation in roundtrip
+  - Added `LightTrackType` enum for 5 animation track types
+  - Added `LightAnimationRaw` struct for raw keyframe storage
+  - Light animation data collected during parse
+  - Animation offsets relocated during write
+  - Handles dynamic lighting effects (ambient/diffuse color, attenuation, visibility)
+- **CLI**: Extended `m2 tree` command to display animation track data
+  - Shows bone animation track summary (translation, rotation, scale counts)
+  - Shows particle emitter animation track summary
+  - Shows ribbon emitter animation track summary
+  - Shows texture animation track summary
+  - Shows color animation track summary
+  - Shows transparency animation track summary
+  - Shows event track summary (timeline triggers)
+  - Shows attachment animation track summary
+  - Shows camera animation track summary
+  - Shows light animation track summary
+  - Displays total keyframe counts for each animation type
+- **M2 Format**: `AnimationManagerBuilder` for direct M2Model integration
+  - Creates `AnimationManager` from parsed `M2Model` data
+  - Resolves bone animation tracks (translation, rotation, scale)
+  - Converts M2Animation sequences to runtime format
+  - Handles both pre-WotLK (ranged) and WotLK+ (per-sequence) data layouts
+
+### Changed
+
+- **Build**: MSRV upgraded from 1.86 to 1.92.0
+  - Updated `rust-version` in workspace `Cargo.toml`
+  - Updated CI workflow toolchain versions
+  - Added `rust-toolchain.toml` for consistent local development
+- **Build**: Code updated for Rust 1.92.0 clippy lints
+  - `collapsible_if`: Use `if let ... && condition` syntax (let_chains)
+  - `manual_is_multiple_of`: Use `is_multiple_of()` method
+  - Affects 38 files across all workspace crates
+
+## [0.5.0] - 2025-01-09
+
+### Added
+
+- **M2 Format**: Animation runtime system for bone transform computation
+  - `animation` module with interpolation, state management, and bone transforms
+  - `BoneTransformComputer` for skeletal animation evaluation
+  - `AnimationManager` for animation playback control
+  - Interpolation utilities with quaternion slerp support
+- **M2 Format**: Particle system simulation
+  - `particles` module with emitter simulation and particle lifecycle
+  - `ParticleEmitter` for GPU-style particle generation
+  - `EmissionType` variants for different emission patterns
+  - Particle and ribbon emitter parsing integrated into `M2Model`
+- **WMO Format**: BSP tree point query for group collision
+  - `bsp` module with efficient point-in-group testing
+  - `BspTree` for accelerated spatial queries
+  - `BspNodeExt` trait for node traversal
+- **WMO Format**: Portal-based visibility culling
+  - `portal` module for interior rendering optimization
+  - `PortalCuller` for view frustum clipping through portals
+  - `ConvexHull` and `Plane` geometry utilities
+- **WMO Format**: Complete MOHD header parsing
+  - Ambient color, WMO ID, bounding box, flags, and LOD count
+  - Previously skipped 36 bytes now fully parsed
+- **ADT Format**: MoP 5.3+ high_res_holes subchunk scanning
+  - `parse_with_offset_and_size` for MCVT/MCNR discovery when offsets are zero
+  - `scan_for_subchunk` utility for sequential chunk searching
+- **ADT Format**: `TextureHeightParams` structure for MTXP entries
+  - Height scale/offset for terrain texture blending
+  - `uses_height_texture()` helper for `_h.blp` texture loading
+- **ADT Format**: `CombinedAlphaMap` public API for alpha map extraction
+- **Build**: Cargo configuration with aliases and stricter lints
+  - `.cargo/config.toml` with `lint`, `test-all`, `qa` aliases
+  - Enhanced clippy lints: `unwrap_used`, `panic`, `todo`, `dbg_macro`
+
+### Changed
+
+- **ADT Format**: MH2O vertex storage changed from `Vec` to 9×9 sparse grid (BREAKING)
+  - `VertexDataArray` now uses `Box<[Option<T>; 81]>` for grid-aligned access
+  - Vertex indexing as `z * 9 + x` matches noggit-red approach
+  - `validate_coverage()` replaces `validate_count()` for position-based validation
+- **ADT Format**: MTXP chunk parsing updated to proper structure
+  - Changed from `Vec<u32>` to `Vec<TextureHeightParams>` (16 bytes per entry)
+  - Includes flags, height_scale, height_offset fields
+- **DBC Format**: WDB2 parser handles extended header (Cataclysm 4.0+)
+  - Basic header (build <= 12880): 28 bytes
+  - Extended header (build > 12880): 48 bytes + index arrays
+  - Properly skips index/string length arrays before record data
+- **Build**: Workspace lints expanded with safety and quality checks
+  - `unwrap_used`, `expect_used`, `panic` warnings for library code
+  - `print_stdout`, `print_stderr` warnings to prefer logging
+
+### Fixed
+
+- **MPQ Format**: HET/BET file lookup collision resolution
+  - Now verifies BET hash for each HET collision candidate
+  - Prevents incorrect file matches when 8-bit HET hash collides
+- **BLP Format**: DXT decompression handles undersized mipmap buffers
+  - Zero-pads compressed data when smaller than required block size
+  - Matches SereniaBLPLib behavior for small mipmaps
+- **ADT Format**: MCNK position coordinate order documented and exposed
+  - File stores `[Z, X, Y]`, added `world_position()` helper returning `[X, Y, Z]`
+  - Documentation clarifies raw field access order
+- **ADT Format**: MCNK `do_not_fix_alpha_map` flag corrected to bit 15 (0x8000)
+  - Was incorrectly checking bit 8 (0x100)
+- **ADT Format**: MH2O exists bitmap reads exact byte count
+  - Calculates `(width * height + 7) / 8` bytes instead of fixed 8 bytes
+  - Prevents reading into vertex data for small liquid instances
+- **ADT Format**: CombinedAlphaMap layer access updated for BinRead structure
+  - Uses `chunk.layers` (MclyChunk) and `chunk.alpha` (McalChunk)
+  - Accesses `layer.flags.alpha_map_compressed()` method
+- **ADT Format**: RLE decompression simplified to not enforce row boundaries
+  - Runs can span row boundaries per actual WoW file behavior
 
 - **ADT Format**: Complete BinRead-based parser rewrite with two-phase parsing architecture
   - Declarative chunk parsing using BinRead derive macros
@@ -610,6 +802,8 @@ and this project adheres to
 - **wow-mpq**: Attributes files use full StormLib-compatible format
   (CRC32+MD5+timestamp) instead of CRC32-only
 
+[0.5.0]: https://github.com/wowemulation-dev/warcraft-rs/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/wowemulation-dev/warcraft-rs/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/wowemulation-dev/warcraft-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/wowemulation-dev/warcraft-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wowemulation-dev/warcraft-rs/compare/v0.1.0...v0.2.0

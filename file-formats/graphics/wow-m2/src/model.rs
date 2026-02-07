@@ -1,13 +1,24 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 
 use crate::io_ext::ReadExt;
 use std::path::Path;
 
-use crate::chunks::animation::M2Animation;
+use crate::chunks::animation::{M2Animation, M2AnimationBlock};
+use crate::chunks::attachment::M2Attachment;
 use crate::chunks::bone::M2Bone;
+use crate::chunks::camera::M2Camera;
+use crate::chunks::color_animation::M2ColorAnimation;
+use crate::chunks::event::M2Event;
 use crate::chunks::infrastructure::{ChunkHeader, ChunkReader};
+use crate::chunks::light::M2Light;
+use crate::chunks::m2_track::{M2Track, M2TrackQuat, M2TrackVec3};
 use crate::chunks::material::M2Material;
+use crate::chunks::particle_emitter::M2ParticleEmitter;
+use crate::chunks::ribbon_emitter::M2RibbonEmitter;
+use crate::chunks::texture_animation::M2TextureAnimation;
+use crate::chunks::transparency_animation::M2TransparencyAnimation;
 use crate::chunks::{
     AfraChunk, AnimationFileIds, BoneData, BoneFileIds, CollisionMeshData, DbocChunk, DpivChunk,
     EdgeFadeData, ExtendedParticleData, GeometryParticleIds, LightingDetails, LodData, M2Texture,
@@ -16,7 +27,7 @@ use crate::chunks::{
     RecursiveParticleIds, SkeletonData, SkeletonFileId, SkinFileIds, TextureAnimationChunk,
     TextureFileIds, WaterfallEffect,
 };
-use crate::common::{M2Array, read_array};
+use crate::common::{M2Array, M2Parse, read_array, read_raw_bytes};
 use crate::error::{M2Error, Result};
 use crate::file_resolver::FileResolver;
 use crate::header::{M2_MAGIC_CHUNKED, M2_MAGIC_LEGACY, M2Header, M2ModelFlags};
@@ -54,6 +65,24 @@ pub struct M2Model {
     pub textures: Vec<M2Texture>,
     /// Materials (render flags)
     pub materials: Vec<M2Material>,
+    /// Particle emitters
+    pub particle_emitters: Vec<M2ParticleEmitter>,
+    /// Ribbon emitters
+    pub ribbon_emitters: Vec<M2RibbonEmitter>,
+    /// Texture animations
+    pub texture_animations: Vec<M2TextureAnimation>,
+    /// Color animations
+    pub color_animations: Vec<M2ColorAnimation>,
+    /// Transparency animations
+    pub transparency_animations: Vec<M2TransparencyAnimation>,
+    /// Events
+    pub events: Vec<M2Event>,
+    /// Attachments
+    pub attachments: Vec<M2Attachment>,
+    /// Cameras
+    pub cameras: Vec<M2Camera>,
+    /// Lights
+    pub lights: Vec<M2Light>,
     /// Raw data for other sections
     /// This is used to preserve data that we don't fully parse yet
     pub raw_data: M2RawData,
@@ -115,15 +144,520 @@ pub struct M2Model {
     pub physics_file_data: Option<PhysicsFileDataChunk>,
 }
 
+/// Type of animation track within a bone
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackType {
+    /// Translation (position) animation
+    #[default]
+    Translation,
+    /// Rotation animation (quaternion)
+    Rotation,
+    /// Scale animation
+    Scale,
+}
+
+/// Type of animation track within a particle emitter
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParticleTrackType {
+    /// Emission speed animation
+    #[default]
+    EmissionSpeed,
+    /// Emission rate animation
+    EmissionRate,
+    /// Emission area animation
+    EmissionArea,
+    /// XY scale animation (C2Vector = 8 bytes)
+    XYScale,
+    /// Z scale animation
+    ZScale,
+    /// Color animation (M2Color = 12 bytes)
+    Color,
+    /// Transparency animation
+    Transparency,
+    /// Size animation
+    Size,
+    /// Intensity animation
+    Intensity,
+    /// Z source animation
+    ZSource,
+}
+
+impl ParticleTrackType {
+    /// Returns the size in bytes of each value for this track type
+    pub fn value_size(&self) -> usize {
+        match self {
+            ParticleTrackType::XYScale => 8, // C2Vector
+            ParticleTrackType::Color => 12,  // M2Color (3 floats)
+            _ => 4,                          // f32
+        }
+    }
+}
+
+/// Type of animation track within a ribbon emitter
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RibbonTrackType {
+    /// Color animation (M2Color = 12 bytes)
+    #[default]
+    Color,
+    /// Alpha (transparency) animation
+    Alpha,
+    /// Height above center animation
+    HeightAbove,
+    /// Height below center animation
+    HeightBelow,
+}
+
+impl RibbonTrackType {
+    /// Returns the size in bytes of each value for this track type
+    pub fn value_size(&self) -> usize {
+        match self {
+            RibbonTrackType::Color => 12, // M2Color (3 floats)
+            _ => 4,                       // f32
+        }
+    }
+}
+
+/// Type of animation track within a texture animation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextureTrackType {
+    /// U coordinate translation animation
+    #[default]
+    TranslationU,
+    /// V coordinate translation animation
+    TranslationV,
+    /// Rotation animation
+    Rotation,
+    /// U coordinate scale animation
+    ScaleU,
+    /// V coordinate scale animation
+    ScaleV,
+}
+
+impl TextureTrackType {
+    /// Returns the size in bytes of each value for this track type
+    pub fn value_size(&self) -> usize {
+        4 // All texture animation tracks use f32
+    }
+}
+
+/// Raw animation data for a single bone track
+///
+/// This preserves the exact bytes from the original file for animation keyframes,
+/// allowing roundtrip serialization without data loss.
+#[derive(Debug, Clone, Default)]
+pub struct BoneAnimationRaw {
+    /// Index of the bone this track belongs to
+    pub bone_index: usize,
+    /// Type of animation track (translation, rotation, scale)
+    pub track_type: TrackType,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (12 bytes for Vec3, 8 bytes for CompQuat)
+    pub values: Vec<u8>,
+    /// Raw interpolation range bytes (pre-WotLK only, 8 bytes per range)
+    pub ranges: Option<Vec<u8>>,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+    /// Original file offset for ranges array (pre-WotLK only)
+    pub original_ranges_offset: Option<u32>,
+}
+
+/// Raw embedded skin data for a single ModelView in pre-WotLK M2 files
+///
+/// Pre-WotLK (versions 256-263) have skin data embedded in the M2 file.
+/// Each ModelView structure (44 bytes) contains M2Arrays pointing to:
+/// - indices (vertex indices into the model's vertex buffer)
+/// - triangles (triangle indices)
+/// - submeshes (mesh subdivision info)
+/// - batches (texture unit assignments)
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddedSkinRaw {
+    /// The raw ModelView structure bytes (44 bytes)
+    pub model_view: Vec<u8>,
+    /// Indices data referenced by the first M2Array
+    pub indices: Vec<u8>,
+    /// Triangles data referenced by the second M2Array
+    pub triangles: Vec<u8>,
+    /// Vertex properties data (usually empty or minimal)
+    pub properties: Vec<u8>,
+    /// Submeshes data
+    pub submeshes: Vec<u8>,
+    /// Batches/texture units data
+    pub batches: Vec<u8>,
+    /// Original offset of the ModelView structure
+    pub original_model_view_offset: u32,
+    /// Original offsets for each M2Array's data
+    pub original_indices_offset: u32,
+    pub original_triangles_offset: u32,
+    pub original_properties_offset: u32,
+    pub original_submeshes_offset: u32,
+    pub original_batches_offset: u32,
+}
+
+/// Raw animation data for a single particle emitter track
+///
+/// This preserves the exact bytes from the original file for particle animation keyframes,
+/// allowing roundtrip serialization without data loss. Particle emitters have 10 different
+/// animation tracks (emission speed, rate, color, etc.).
+#[derive(Debug, Clone, Default)]
+pub struct ParticleAnimationRaw {
+    /// Index of the particle emitter this track belongs to
+    pub emitter_index: usize,
+    /// Type of animation track
+    pub track_type: ParticleTrackType,
+    /// Raw interpolation range bytes (8 bytes per range: start u32 + end u32)
+    pub interpolation_ranges: Vec<u8>,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (size depends on track type)
+    pub values: Vec<u8>,
+    /// Original file offset for interpolation_ranges array
+    pub original_ranges_offset: u32,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+}
+
+/// Raw animation data for a single ribbon emitter track
+///
+/// This preserves the exact bytes from the original file for ribbon animation keyframes,
+/// allowing roundtrip serialization without data loss. Ribbon emitters have 4 different
+/// animation tracks (color, alpha, height_above, height_below).
+#[derive(Debug, Clone, Default)]
+pub struct RibbonAnimationRaw {
+    /// Index of the ribbon emitter this track belongs to
+    pub emitter_index: usize,
+    /// Type of animation track
+    pub track_type: RibbonTrackType,
+    /// Raw interpolation range bytes (8 bytes per range: start u32 + end u32)
+    pub interpolation_ranges: Vec<u8>,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (size depends on track type)
+    pub values: Vec<u8>,
+    /// Original file offset for interpolation_ranges array
+    pub original_ranges_offset: u32,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+}
+
+/// Raw animation data for a single texture animation track
+///
+/// This preserves the exact bytes from the original file for texture animation keyframes,
+/// allowing roundtrip serialization without data loss. Texture animations have 5 different
+/// animation tracks (translation_u, translation_v, rotation, scale_u, scale_v).
+#[derive(Debug, Clone, Default)]
+pub struct TextureAnimationRaw {
+    /// Index of the texture animation this track belongs to
+    pub animation_index: usize,
+    /// Type of animation track
+    pub track_type: TextureTrackType,
+    /// Raw interpolation range bytes (8 bytes per range: start u32 + end u32)
+    pub interpolation_ranges: Vec<u8>,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (4 bytes per value - all tracks use f32)
+    pub values: Vec<u8>,
+    /// Original file offset for interpolation_ranges array
+    pub original_ranges_offset: u32,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+}
+
+/// Type of animation track within a color animation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorTrackType {
+    /// RGB color animation (M2Color = 12 bytes)
+    #[default]
+    Color,
+    /// Alpha animation (u16 = 2 bytes)
+    Alpha,
+}
+
+impl ColorTrackType {
+    /// Returns the size in bytes of each value for this track type
+    pub fn value_size(&self) -> usize {
+        match self {
+            ColorTrackType::Color => 12, // M2Color (3 floats)
+            ColorTrackType::Alpha => 2,  // u16
+        }
+    }
+}
+
+/// Raw animation data for a single color animation track
+///
+/// This preserves the exact bytes from the original file for color animation keyframes,
+/// allowing roundtrip serialization without data loss. Color animations have 2 different
+/// animation tracks (color RGB, alpha).
+#[derive(Debug, Clone, Default)]
+pub struct ColorAnimationRaw {
+    /// Index of the color animation this track belongs to
+    pub animation_index: usize,
+    /// Type of animation track
+    pub track_type: ColorTrackType,
+    /// Raw interpolation range bytes (8 bytes per range: start u32 + end u32)
+    pub interpolation_ranges: Vec<u8>,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (12 bytes for color, 2 bytes for alpha)
+    pub values: Vec<u8>,
+    /// Original file offset for interpolation_ranges array
+    pub original_ranges_offset: u32,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+}
+
+/// Type of animation track within a transparency animation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransparencyTrackType {
+    /// Alpha animation (f32 = 4 bytes)
+    #[default]
+    Alpha,
+}
+
+impl TransparencyTrackType {
+    /// Returns the size in bytes of each value for this track type
+    pub fn value_size(&self) -> usize {
+        4 // f32
+    }
+}
+
+/// Raw animation data for a single transparency animation track
+///
+/// This preserves the exact bytes from the original file for transparency animation keyframes,
+/// allowing roundtrip serialization without data loss. Transparency animations have 1
+/// animation track (alpha).
+#[derive(Debug, Clone, Default)]
+pub struct TransparencyAnimationRaw {
+    /// Index of the transparency animation this track belongs to
+    pub animation_index: usize,
+    /// Type of animation track
+    pub track_type: TransparencyTrackType,
+    /// Raw interpolation range bytes (8 bytes per range: start u32 + end u32)
+    pub interpolation_ranges: Vec<u8>,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (4 bytes for f32 alpha)
+    pub values: Vec<u8>,
+    /// Original file offset for interpolation_ranges array
+    pub original_ranges_offset: u32,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+}
+
+/// Raw event track data for a single event
+///
+/// This preserves the exact bytes from the original file for event data,
+/// allowing roundtrip serialization without data loss. Events have two M2Arrays:
+/// ranges (per-animation timing info) and times (u32 timestamps when event triggers).
+#[derive(Debug, Clone, Default)]
+pub struct EventRaw {
+    /// Index of the event this track belongs to
+    pub event_index: usize,
+    /// Raw ranges bytes (8 bytes per range: start, end timestamps)
+    pub ranges: Vec<u8>,
+    /// Original file offset for ranges array
+    pub original_ranges_offset: u32,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+}
+
+/// Type of animation track within an attachment
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttachmentTrackType {
+    /// Scale animation (f32 = 4 bytes)
+    #[default]
+    Scale,
+}
+
+impl AttachmentTrackType {
+    /// Returns the size in bytes of each value for this track type
+    pub fn value_size(&self) -> usize {
+        4 // f32
+    }
+}
+
+/// Raw animation data for a single attachment track
+///
+/// This preserves the exact bytes from the original file for attachment animation keyframes,
+/// allowing roundtrip serialization without data loss. Attachments have 1 animation track (scale).
+#[derive(Debug, Clone, Default)]
+pub struct AttachmentAnimationRaw {
+    /// Index of the attachment this track belongs to
+    pub attachment_index: usize,
+    /// Type of animation track
+    pub track_type: AttachmentTrackType,
+    /// Raw interpolation range bytes (8 bytes per range: start u32 + end u32)
+    pub interpolation_ranges: Vec<u8>,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (4 bytes for f32 scale)
+    pub values: Vec<u8>,
+    /// Original file offset for interpolation_ranges array
+    pub original_ranges_offset: u32,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+}
+
+/// Type of animation track for camera structures
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CameraTrackType {
+    /// Camera position animation (C3Vector = 12 bytes)
+    #[default]
+    Position,
+    /// Target position animation (C3Vector = 12 bytes)
+    TargetPosition,
+    /// Roll animation (f32 = 4 bytes)
+    Roll,
+}
+
+impl CameraTrackType {
+    /// Returns the size in bytes of a single keyframe value for this track type
+    pub fn value_size(&self) -> usize {
+        match self {
+            CameraTrackType::Position | CameraTrackType::TargetPosition => 12, // C3Vector
+            CameraTrackType::Roll => 4,                                        // f32
+        }
+    }
+}
+
+/// Raw animation data for a single camera track
+///
+/// This preserves the exact bytes from the original file for camera animation keyframes,
+/// allowing roundtrip serialization without data loss. Cameras have 3 animation tracks
+/// (position, target_position, roll).
+#[derive(Debug, Clone, Default)]
+pub struct CameraAnimationRaw {
+    /// Index of the camera this track belongs to
+    pub camera_index: usize,
+    /// Type of animation track
+    pub track_type: CameraTrackType,
+    /// Raw interpolation range bytes (8 bytes per range: start u32 + end u32)
+    pub interpolation_ranges: Vec<u8>,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (size depends on track type)
+    pub values: Vec<u8>,
+    /// Original file offset for interpolation_ranges array
+    pub original_ranges_offset: u32,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+}
+
+/// Type of animation track for light structures
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LightTrackType {
+    /// Ambient color animation (M2Color = 12 bytes: RGB as f32)
+    #[default]
+    AmbientColor,
+    /// Diffuse color animation (M2Color = 12 bytes: RGB as f32)
+    DiffuseColor,
+    /// Attenuation start animation (f32 = 4 bytes)
+    AttenuationStart,
+    /// Attenuation end animation (f32 = 4 bytes)
+    AttenuationEnd,
+    /// Visibility animation (f32 = 4 bytes)
+    Visibility,
+}
+
+impl LightTrackType {
+    /// Returns the size in bytes of a single keyframe value for this track type
+    pub fn value_size(&self) -> usize {
+        match self {
+            LightTrackType::AmbientColor | LightTrackType::DiffuseColor => 12, // M2Color (3 f32s)
+            LightTrackType::AttenuationStart
+            | LightTrackType::AttenuationEnd
+            | LightTrackType::Visibility => 4, // f32
+        }
+    }
+}
+
+/// Raw animation data for a single light track
+///
+/// This preserves the exact bytes from the original file for light animation keyframes,
+/// allowing roundtrip serialization without data loss. Lights have 5 animation tracks
+/// (ambient_color, diffuse_color, attenuation_start, attenuation_end, visibility).
+#[derive(Debug, Clone, Default)]
+pub struct LightAnimationRaw {
+    /// Index of the light this track belongs to
+    pub light_index: usize,
+    /// Type of animation track
+    pub track_type: LightTrackType,
+    /// Raw interpolation range bytes (8 bytes per range: start u32 + end u32)
+    pub interpolation_ranges: Vec<u8>,
+    /// Raw timestamp bytes (4 bytes per timestamp)
+    pub timestamps: Vec<u8>,
+    /// Raw keyframe value bytes (size depends on track type)
+    pub values: Vec<u8>,
+    /// Original file offset for interpolation_ranges array
+    pub original_ranges_offset: u32,
+    /// Original file offset for timestamps array
+    pub original_timestamps_offset: u32,
+    /// Original file offset for values array
+    pub original_values_offset: u32,
+}
+
 /// Raw data for sections that are not fully parsed
 #[derive(Debug, Clone, Default)]
 pub struct M2RawData {
-    /// Transparency data
+    /// Raw animation keyframe data for all bone tracks
+    /// Used to preserve animation data during roundtrip serialization
+    pub bone_animation_data: Vec<BoneAnimationRaw>,
+    /// Raw embedded skin data for pre-WotLK models (version <= 263)
+    /// Empty for WotLK+ models which use external .skin files
+    pub embedded_skins: Vec<EmbeddedSkinRaw>,
+    /// Raw animation keyframe data for all particle emitter tracks
+    /// Used to preserve particle animation data during roundtrip serialization
+    pub particle_animation_data: Vec<ParticleAnimationRaw>,
+    /// Raw animation keyframe data for all ribbon emitter tracks
+    /// Used to preserve ribbon animation data during roundtrip serialization
+    pub ribbon_animation_data: Vec<RibbonAnimationRaw>,
+    /// Raw animation keyframe data for all texture animation tracks
+    /// Used to preserve texture animation data during roundtrip serialization
+    pub texture_animation_data: Vec<TextureAnimationRaw>,
+    /// Raw animation keyframe data for all color animation tracks
+    /// Used to preserve color animation data during roundtrip serialization
+    pub color_animation_data: Vec<ColorAnimationRaw>,
+    /// Raw animation keyframe data for all transparency animation tracks
+    /// Used to preserve transparency animation data during roundtrip serialization
+    pub transparency_animation_data: Vec<TransparencyAnimationRaw>,
+    /// Raw event track data for all events
+    /// Used to preserve event timestamp data during roundtrip serialization
+    pub event_data: Vec<EventRaw>,
+    /// Raw animation keyframe data for all attachment tracks
+    /// Used to preserve attachment animation data during roundtrip serialization
+    pub attachment_animation_data: Vec<AttachmentAnimationRaw>,
+    /// Raw animation keyframe data for all camera tracks
+    /// Used to preserve camera animation data during roundtrip serialization
+    pub camera_animation_data: Vec<CameraAnimationRaw>,
+    /// Raw animation keyframe data for all light tracks
+    /// Used to preserve light animation data during roundtrip serialization
+    pub light_animation_data: Vec<LightAnimationRaw>,
+    /// Transparency data (the actual transparency animations, not lookups)
     pub transparency: Vec<u8>,
-    /// Texture animations
+    /// Texture animations (legacy raw storage, being replaced by texture_animation_data)
     pub texture_animations: Vec<u8>,
     /// Color animations
     pub color_animations: Vec<u8>,
+    /// Color replacements
+    pub color_replacements: Vec<u8>,
     /// Render flags
     pub render_flags: Vec<u8>,
     /// Bone lookup table
@@ -154,12 +688,20 @@ pub struct M2RawData {
     pub cameras: Vec<u8>,
     /// Camera lookup table
     pub camera_lookup_table: Vec<u16>,
-    /// Ribbon emitters
+    /// Ribbon emitters (raw, for versions where we don't parse)
     pub ribbon_emitters: Vec<u8>,
-    /// Particle emitters
+    /// Particle emitters (raw, for versions where we don't parse)
     pub particle_emitters: Vec<u8>,
+    /// Views data (embedded skins for pre-WotLK, raw bytes)
+    pub views_data: Vec<u8>,
+    /// Texture flipbooks (BC and earlier)
+    pub texture_flipbooks: Option<Vec<u8>>,
+    /// Blend map overrides (BC+ with specific flag)
+    pub blend_map_overrides: Option<Vec<u8>>,
     /// Texture combiner combos (added in Cataclysm)
     pub texture_combiner_combos: Option<Vec<u8>>,
+    /// Texture transforms (added in Legion)
+    pub texture_transforms: Option<Vec<u8>>,
 }
 
 /// Parse an M2 model, automatically detecting format
@@ -175,6 +717,1629 @@ pub fn parse_m2<R: Read + Seek>(reader: &mut R) -> Result<M2Format> {
         }
         _ => Err(M2Error::InvalidMagicBytes(magic)),
     }
+}
+
+/// Collects raw animation keyframe data for a single M2Track
+///
+/// Returns None if the track has no data, otherwise returns BoneAnimationRaw
+/// with timestamps, values, and optionally ranges (for pre-WotLK).
+fn collect_track_data<R: Read + Seek, T>(
+    reader: &mut R,
+    track: &M2Track<T>,
+    version: u32,
+    value_element_size: usize,
+    bone_index: usize,
+    track_type: TrackType,
+) -> Result<Option<BoneAnimationRaw>> {
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.is_empty() {
+        return Ok(None);
+    }
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values
+    let values = if !track.values.is_empty() {
+        read_raw_bytes(reader, &track.values.convert(), value_element_size)?
+    } else {
+        Vec::new()
+    };
+
+    // Read ranges for pre-WotLK (8 bytes per range: start u32 + end u32)
+    let (ranges, original_ranges_offset) = if version < 264 {
+        if let Some(ref ranges_array) = track.ranges {
+            if !ranges_array.is_empty() {
+                (
+                    Some(read_raw_bytes(reader, &ranges_array.convert(), 8)?),
+                    Some(ranges_array.offset),
+                )
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(Some(BoneAnimationRaw {
+        bone_index,
+        track_type,
+        timestamps,
+        values,
+        ranges,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.offset,
+        original_ranges_offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all bones in the model
+///
+/// This reads the actual keyframe bytes (timestamps, values, ranges) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_bone_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    bones: &[M2Bone],
+    version: u32,
+) -> Result<Vec<BoneAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (bone_idx, bone) in bones.iter().enumerate() {
+        // Collect translation track (C3Vector = 12 bytes per value)
+        if let Some(data) = collect_track_data(
+            reader,
+            &bone.translation,
+            version,
+            12,
+            bone_idx,
+            TrackType::Translation,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect rotation track (M2CompQuat = 8 bytes per value)
+        if let Some(data) = collect_track_data(
+            reader,
+            &bone.rotation,
+            version,
+            8,
+            bone_idx,
+            TrackType::Rotation,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect scale track (C3Vector = 12 bytes per value)
+        if let Some(data) =
+            collect_track_data(reader, &bone.scale, version, 12, bone_idx, TrackType::Scale)?
+        {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Updates M2Track offsets in a bone using the relocation map
+///
+/// If a track's original offset is not in the map but the track has data,
+/// the track is zeroed out to avoid invalid references.
+fn relocate_bone_track_offsets(bone: &mut M2Bone, offset_map: &HashMap<u32, u32>) {
+    // Helper to relocate or zero a track
+    fn relocate_or_zero_track<T: Default>(track: &mut M2Track<T>, offset_map: &HashMap<u32, u32>) {
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *track = M2Track::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.offset) {
+                track.values.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *track = M2Track::default();
+                return;
+            }
+        }
+
+        // Check if ranges offset needs relocation (pre-WotLK)
+        if let Some(ref mut ranges) = track.ranges
+            && !ranges.is_empty()
+        {
+            if let Some(&new_offset) = offset_map.get(&ranges.offset) {
+                ranges.offset = new_offset;
+            } else {
+                // Ranges data not collected - set to empty
+                *ranges = M2Array::default();
+            }
+        }
+    }
+
+    relocate_or_zero_track(&mut bone.translation, offset_map);
+    relocate_or_zero_track(&mut bone.rotation, offset_map);
+    relocate_or_zero_track(&mut bone.scale, offset_map);
+}
+
+/// Updates M2AnimationBlock offsets in a particle emitter using the relocation map
+///
+/// If a track's original offset is not in the map but the track has data,
+/// the track is zeroed out to avoid invalid references.
+fn relocate_particle_animation_offsets(
+    emitter: &mut M2ParticleEmitter,
+    offset_map: &HashMap<u32, u32>,
+) {
+    // Helper to relocate or zero an animation block
+    fn relocate_or_zero_animation_block<T: M2Parse + Default + Clone>(
+        block: &mut M2AnimationBlock<T>,
+        offset_map: &HashMap<u32, u32>,
+    ) {
+        let track = &mut block.track;
+
+        // Check if interpolation_ranges offset needs relocation
+        if !track.interpolation_ranges.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.interpolation_ranges.offset) {
+                track.interpolation_ranges.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.array.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.array.offset) {
+                track.values.array.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+            }
+        }
+    }
+
+    relocate_or_zero_animation_block(&mut emitter.emission_speed_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.emission_rate_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.emission_area_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.xy_scale_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.z_scale_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.color_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.transparency_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.size_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.intensity_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.z_source_animation, offset_map);
+}
+
+/// Updates M2AnimationBlock offsets in a ribbon emitter using the relocation map
+///
+/// If a track's original offset is not in the map but the track has data,
+/// the track is zeroed out to avoid invalid references.
+fn relocate_ribbon_animation_offsets(
+    emitter: &mut M2RibbonEmitter,
+    offset_map: &HashMap<u32, u32>,
+) {
+    // Helper to relocate or zero an animation block
+    fn relocate_or_zero_animation_block<T: M2Parse + Default + Clone>(
+        block: &mut M2AnimationBlock<T>,
+        offset_map: &HashMap<u32, u32>,
+    ) {
+        let track = &mut block.track;
+
+        // Check if interpolation_ranges offset needs relocation
+        if !track.interpolation_ranges.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.interpolation_ranges.offset) {
+                track.interpolation_ranges.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.array.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.array.offset) {
+                track.values.array.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+            }
+        }
+    }
+
+    relocate_or_zero_animation_block(&mut emitter.color_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.alpha_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.height_above_animation, offset_map);
+    relocate_or_zero_animation_block(&mut emitter.height_below_animation, offset_map);
+}
+
+/// Relocates texture animation offsets in a texture animation to new positions
+fn relocate_texture_animation_offsets(
+    animation: &mut M2TextureAnimation,
+    offset_map: &HashMap<u32, u32>,
+) {
+    // Helper to relocate or zero an animation block
+    fn relocate_or_zero_animation_block<T: M2Parse + Default + Clone>(
+        block: &mut M2AnimationBlock<T>,
+        offset_map: &HashMap<u32, u32>,
+    ) {
+        let track = &mut block.track;
+
+        // Check if interpolation_ranges offset needs relocation
+        if !track.interpolation_ranges.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.interpolation_ranges.offset) {
+                track.interpolation_ranges.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.array.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.array.offset) {
+                track.values.array.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+            }
+        }
+    }
+
+    relocate_or_zero_animation_block(&mut animation.translation_u, offset_map);
+    relocate_or_zero_animation_block(&mut animation.translation_v, offset_map);
+    relocate_or_zero_animation_block(&mut animation.rotation, offset_map);
+    relocate_or_zero_animation_block(&mut animation.scale_u, offset_map);
+    relocate_or_zero_animation_block(&mut animation.scale_v, offset_map);
+}
+
+/// Relocates color animation offsets in a color animation to new positions
+fn relocate_color_animation_offsets(
+    animation: &mut M2ColorAnimation,
+    offset_map: &HashMap<u32, u32>,
+) {
+    // Helper to relocate or zero an animation block
+    fn relocate_or_zero_animation_block<T: M2Parse + Default + Clone>(
+        block: &mut M2AnimationBlock<T>,
+        offset_map: &HashMap<u32, u32>,
+    ) {
+        let track = &mut block.track;
+
+        // Check if interpolation_ranges offset needs relocation
+        if !track.interpolation_ranges.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.interpolation_ranges.offset) {
+                track.interpolation_ranges.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.array.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.array.offset) {
+                track.values.array.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+            }
+        }
+    }
+
+    relocate_or_zero_animation_block(&mut animation.color, offset_map);
+    relocate_or_zero_animation_block(&mut animation.alpha, offset_map);
+}
+
+/// Relocates transparency animation offsets in a transparency animation to new positions
+fn relocate_transparency_animation_offsets(
+    animation: &mut M2TransparencyAnimation,
+    offset_map: &HashMap<u32, u32>,
+) {
+    // Helper to relocate or zero an animation block
+    fn relocate_or_zero_animation_block<T: M2Parse + Default + Clone>(
+        block: &mut M2AnimationBlock<T>,
+        offset_map: &HashMap<u32, u32>,
+    ) {
+        let track = &mut block.track;
+
+        // Check if interpolation_ranges offset needs relocation
+        if !track.interpolation_ranges.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.interpolation_ranges.offset) {
+                track.interpolation_ranges.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.array.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.array.offset) {
+                track.values.array.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+            }
+        }
+    }
+
+    relocate_or_zero_animation_block(&mut animation.alpha, offset_map);
+}
+
+/// Relocates event track offsets to new positions
+///
+/// Events have two M2Arrays: ranges and times. Both need relocation.
+fn relocate_event_offset(event: &mut M2Event, offset_map: &HashMap<u32, u32>) {
+    // Relocate ranges if present
+    if event.ranges.count > 0 {
+        if let Some(&new_offset) = offset_map.get(&event.ranges.offset) {
+            event.ranges.offset = new_offset;
+        } else {
+            event.ranges = M2Array::default();
+        }
+    }
+
+    // Relocate times if present
+    if event.times.count > 0 {
+        if let Some(&new_offset) = offset_map.get(&event.times.offset) {
+            event.times.offset = new_offset;
+        } else {
+            event.times = M2Array::default();
+        }
+    }
+}
+
+/// Relocates attachment animation offsets to new positions
+///
+/// Attachments have a single scale animation track (`M2AnimationBlock<f32>`).
+fn relocate_attachment_animation_offsets(
+    attachment: &mut M2Attachment,
+    offset_map: &HashMap<u32, u32>,
+) {
+    // Helper to relocate or zero an animation block
+    fn relocate_or_zero_animation_block<T: M2Parse + Default + Clone>(
+        block: &mut M2AnimationBlock<T>,
+        offset_map: &HashMap<u32, u32>,
+    ) {
+        let track = &mut block.track;
+
+        // Check if interpolation_ranges offset needs relocation
+        if !track.interpolation_ranges.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.interpolation_ranges.offset) {
+                track.interpolation_ranges.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.array.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.array.offset) {
+                track.values.array.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+            }
+        }
+    }
+
+    relocate_or_zero_animation_block(&mut attachment.scale_animation, offset_map);
+}
+
+/// Relocates camera animation offsets to new positions
+///
+/// Cameras have three animation tracks: position, target_position, and roll.
+fn relocate_camera_animation_offsets(camera: &mut M2Camera, offset_map: &HashMap<u32, u32>) {
+    // Helper to relocate or zero an animation block
+    fn relocate_or_zero_animation_block<T: M2Parse + Default + Clone>(
+        block: &mut M2AnimationBlock<T>,
+        offset_map: &HashMap<u32, u32>,
+    ) {
+        let track = &mut block.track;
+
+        // Check if interpolation_ranges offset needs relocation
+        if !track.interpolation_ranges.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.interpolation_ranges.offset) {
+                track.interpolation_ranges.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.array.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.array.offset) {
+                track.values.array.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+            }
+        }
+    }
+
+    relocate_or_zero_animation_block(&mut camera.position_animation, offset_map);
+    relocate_or_zero_animation_block(&mut camera.target_position_animation, offset_map);
+    relocate_or_zero_animation_block(&mut camera.roll_animation, offset_map);
+}
+
+/// Relocates light animation offsets to new positions
+///
+/// Lights have five animation tracks: ambient_color, diffuse_color, attenuation_start,
+/// attenuation_end, and visibility.
+fn relocate_light_animation_offsets(light: &mut M2Light, offset_map: &HashMap<u32, u32>) {
+    // Helper to relocate or zero an animation block
+    fn relocate_or_zero_animation_block<T: M2Parse + Default + Clone>(
+        block: &mut M2AnimationBlock<T>,
+        offset_map: &HashMap<u32, u32>,
+    ) {
+        let track = &mut block.track;
+
+        // Check if interpolation_ranges offset needs relocation
+        if !track.interpolation_ranges.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.interpolation_ranges.offset) {
+                track.interpolation_ranges.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if timestamps offset needs relocation
+        if !track.timestamps.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.timestamps.offset) {
+                track.timestamps.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+                return;
+            }
+        }
+
+        // Check if values offset needs relocation
+        if !track.values.array.is_empty() {
+            if let Some(&new_offset) = offset_map.get(&track.values.array.offset) {
+                track.values.array.offset = new_offset;
+            } else {
+                // Data not collected - zero out the track
+                *block = M2AnimationBlock::default();
+            }
+        }
+    }
+
+    relocate_or_zero_animation_block(&mut light.ambient_color_animation, offset_map);
+    relocate_or_zero_animation_block(&mut light.diffuse_color_animation, offset_map);
+    relocate_or_zero_animation_block(&mut light.attenuation_start_animation, offset_map);
+    relocate_or_zero_animation_block(&mut light.attenuation_end_animation, offset_map);
+    relocate_or_zero_animation_block(&mut light.visibility_animation, offset_map);
+}
+
+/// Collects raw animation keyframe data for a single M2AnimationBlock
+///
+/// Returns None if the track has no data, otherwise returns ParticleAnimationRaw
+/// with interpolation_ranges, timestamps, and values.
+fn collect_particle_track_data<R: Read + Seek, T: M2Parse>(
+    reader: &mut R,
+    block: &M2AnimationBlock<T>,
+    emitter_index: usize,
+    track_type: ParticleTrackType,
+) -> Result<Option<ParticleAnimationRaw>> {
+    let track = &block.track;
+
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.array.is_empty() {
+        return Ok(None);
+    }
+
+    // Read interpolation ranges (8 bytes per range: start u32 + end u32)
+    let interpolation_ranges = if !track.interpolation_ranges.is_empty() {
+        read_raw_bytes(reader, &track.interpolation_ranges.convert(), 8)?
+    } else {
+        Vec::new()
+    };
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values (size depends on track type)
+    let values = if !track.values.array.is_empty() {
+        read_raw_bytes(
+            reader,
+            &track.values.array.convert(),
+            track_type.value_size(),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(ParticleAnimationRaw {
+        emitter_index,
+        track_type,
+        interpolation_ranges,
+        timestamps,
+        values,
+        original_ranges_offset: track.interpolation_ranges.offset,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.array.offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all particle emitters in the model
+///
+/// This reads the actual keyframe bytes (interpolation_ranges, timestamps, values) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_particle_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    emitters: &[M2ParticleEmitter],
+) -> Result<Vec<ParticleAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (emitter_idx, emitter) in emitters.iter().enumerate() {
+        // Collect emission speed track (f32 = 4 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.emission_speed_animation,
+            emitter_idx,
+            ParticleTrackType::EmissionSpeed,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect emission rate track (f32 = 4 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.emission_rate_animation,
+            emitter_idx,
+            ParticleTrackType::EmissionRate,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect emission area track (f32 = 4 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.emission_area_animation,
+            emitter_idx,
+            ParticleTrackType::EmissionArea,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect XY scale track (C2Vector = 8 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.xy_scale_animation,
+            emitter_idx,
+            ParticleTrackType::XYScale,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect Z scale track (f32 = 4 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.z_scale_animation,
+            emitter_idx,
+            ParticleTrackType::ZScale,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect color track (M2Color = 12 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.color_animation,
+            emitter_idx,
+            ParticleTrackType::Color,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect transparency track (f32 = 4 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.transparency_animation,
+            emitter_idx,
+            ParticleTrackType::Transparency,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect size track (f32 = 4 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.size_animation,
+            emitter_idx,
+            ParticleTrackType::Size,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect intensity track (f32 = 4 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.intensity_animation,
+            emitter_idx,
+            ParticleTrackType::Intensity,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect Z source track (f32 = 4 bytes)
+        if let Some(data) = collect_particle_track_data(
+            reader,
+            &emitter.z_source_animation,
+            emitter_idx,
+            ParticleTrackType::ZSource,
+        )? {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Collects raw animation keyframe data for a single ribbon emitter M2AnimationBlock
+///
+/// Returns None if the track has no data, otherwise returns RibbonAnimationRaw
+/// with interpolation_ranges, timestamps, and values.
+fn collect_ribbon_track_data<R: Read + Seek, T: M2Parse>(
+    reader: &mut R,
+    block: &M2AnimationBlock<T>,
+    emitter_index: usize,
+    track_type: RibbonTrackType,
+) -> Result<Option<RibbonAnimationRaw>> {
+    let track = &block.track;
+
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.array.is_empty() {
+        return Ok(None);
+    }
+
+    // Read interpolation ranges (8 bytes per range: start u32 + end u32)
+    let interpolation_ranges = if !track.interpolation_ranges.is_empty() {
+        read_raw_bytes(reader, &track.interpolation_ranges.convert(), 8)?
+    } else {
+        Vec::new()
+    };
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values (size depends on track type)
+    let values = if !track.values.array.is_empty() {
+        read_raw_bytes(
+            reader,
+            &track.values.array.convert(),
+            track_type.value_size(),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(RibbonAnimationRaw {
+        emitter_index,
+        track_type,
+        interpolation_ranges,
+        timestamps,
+        values,
+        original_ranges_offset: track.interpolation_ranges.offset,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.array.offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all ribbon emitters in the model
+///
+/// This reads the actual keyframe bytes (interpolation_ranges, timestamps, values) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_ribbon_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    emitters: &[M2RibbonEmitter],
+) -> Result<Vec<RibbonAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (emitter_idx, emitter) in emitters.iter().enumerate() {
+        // Collect color track (M2Color = 12 bytes)
+        if let Some(data) = collect_ribbon_track_data(
+            reader,
+            &emitter.color_animation,
+            emitter_idx,
+            RibbonTrackType::Color,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect alpha track (f32 = 4 bytes)
+        if let Some(data) = collect_ribbon_track_data(
+            reader,
+            &emitter.alpha_animation,
+            emitter_idx,
+            RibbonTrackType::Alpha,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect height above track (f32 = 4 bytes)
+        if let Some(data) = collect_ribbon_track_data(
+            reader,
+            &emitter.height_above_animation,
+            emitter_idx,
+            RibbonTrackType::HeightAbove,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect height below track (f32 = 4 bytes)
+        if let Some(data) = collect_ribbon_track_data(
+            reader,
+            &emitter.height_below_animation,
+            emitter_idx,
+            RibbonTrackType::HeightBelow,
+        )? {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Collects raw keyframe data for a single texture animation track
+fn collect_texture_track_data<R: Read + Seek, T: M2Parse>(
+    reader: &mut R,
+    block: &M2AnimationBlock<T>,
+    animation_index: usize,
+    track_type: TextureTrackType,
+) -> Result<Option<TextureAnimationRaw>> {
+    let track = &block.track;
+
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.array.is_empty() {
+        return Ok(None);
+    }
+
+    // Read interpolation ranges (8 bytes per range: start u32 + end u32)
+    let interpolation_ranges = if !track.interpolation_ranges.is_empty() {
+        read_raw_bytes(reader, &track.interpolation_ranges.convert(), 8)?
+    } else {
+        Vec::new()
+    };
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values (4 bytes per f32 value)
+    let values = if !track.values.array.is_empty() {
+        read_raw_bytes(
+            reader,
+            &track.values.array.convert(),
+            track_type.value_size(),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(TextureAnimationRaw {
+        animation_index,
+        track_type,
+        interpolation_ranges,
+        timestamps,
+        values,
+        original_ranges_offset: track.interpolation_ranges.offset,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.array.offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all texture animations in the model
+///
+/// This reads the actual keyframe bytes (interpolation_ranges, timestamps, values) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_texture_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    animations: &[M2TextureAnimation],
+) -> Result<Vec<TextureAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (anim_idx, anim) in animations.iter().enumerate() {
+        // Collect translation_u track (f32 = 4 bytes)
+        if let Some(data) = collect_texture_track_data(
+            reader,
+            &anim.translation_u,
+            anim_idx,
+            TextureTrackType::TranslationU,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect translation_v track (f32 = 4 bytes)
+        if let Some(data) = collect_texture_track_data(
+            reader,
+            &anim.translation_v,
+            anim_idx,
+            TextureTrackType::TranslationV,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect rotation track (f32 = 4 bytes)
+        if let Some(data) = collect_texture_track_data(
+            reader,
+            &anim.rotation,
+            anim_idx,
+            TextureTrackType::Rotation,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect scale_u track (f32 = 4 bytes)
+        if let Some(data) =
+            collect_texture_track_data(reader, &anim.scale_u, anim_idx, TextureTrackType::ScaleU)?
+        {
+            animation_data.push(data);
+        }
+
+        // Collect scale_v track (f32 = 4 bytes)
+        if let Some(data) =
+            collect_texture_track_data(reader, &anim.scale_v, anim_idx, TextureTrackType::ScaleV)?
+        {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Collects raw keyframe data for a single color animation track
+fn collect_color_track_data<R: Read + Seek, T: M2Parse>(
+    reader: &mut R,
+    block: &M2AnimationBlock<T>,
+    animation_index: usize,
+    track_type: ColorTrackType,
+) -> Result<Option<ColorAnimationRaw>> {
+    let track = &block.track;
+
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.array.is_empty() {
+        return Ok(None);
+    }
+
+    // Read interpolation ranges (8 bytes per range: start u32 + end u32)
+    let interpolation_ranges = if !track.interpolation_ranges.is_empty() {
+        read_raw_bytes(reader, &track.interpolation_ranges.convert(), 8)?
+    } else {
+        Vec::new()
+    };
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values (size depends on track type)
+    let values = if !track.values.array.is_empty() {
+        read_raw_bytes(
+            reader,
+            &track.values.array.convert(),
+            track_type.value_size(),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(ColorAnimationRaw {
+        animation_index,
+        track_type,
+        interpolation_ranges,
+        timestamps,
+        values,
+        original_ranges_offset: track.interpolation_ranges.offset,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.array.offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all color animations in the model
+///
+/// This reads the actual keyframe bytes (interpolation_ranges, timestamps, values) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_color_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    animations: &[M2ColorAnimation],
+) -> Result<Vec<ColorAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (anim_idx, anim) in animations.iter().enumerate() {
+        // Collect color track (M2Color = 12 bytes)
+        if let Some(data) =
+            collect_color_track_data(reader, &anim.color, anim_idx, ColorTrackType::Color)?
+        {
+            animation_data.push(data);
+        }
+
+        // Collect alpha track (u16 = 2 bytes)
+        if let Some(data) =
+            collect_color_track_data(reader, &anim.alpha, anim_idx, ColorTrackType::Alpha)?
+        {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Collects raw keyframe data for a single transparency animation track
+fn collect_transparency_track_data<R: Read + Seek, T: M2Parse>(
+    reader: &mut R,
+    block: &M2AnimationBlock<T>,
+    animation_index: usize,
+    track_type: TransparencyTrackType,
+) -> Result<Option<TransparencyAnimationRaw>> {
+    let track = &block.track;
+
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.array.is_empty() {
+        return Ok(None);
+    }
+
+    // Read interpolation ranges (8 bytes per range: start u32 + end u32)
+    let interpolation_ranges = if !track.interpolation_ranges.is_empty() {
+        read_raw_bytes(reader, &track.interpolation_ranges.convert(), 8)?
+    } else {
+        Vec::new()
+    };
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values (f32 = 4 bytes per alpha value)
+    let values = if !track.values.array.is_empty() {
+        read_raw_bytes(
+            reader,
+            &track.values.array.convert(),
+            track_type.value_size(),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(TransparencyAnimationRaw {
+        animation_index,
+        track_type,
+        interpolation_ranges,
+        timestamps,
+        values,
+        original_ranges_offset: track.interpolation_ranges.offset,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.array.offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all transparency animations in the model
+///
+/// This reads the actual keyframe bytes (interpolation_ranges, timestamps, values) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_transparency_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    animations: &[M2TransparencyAnimation],
+) -> Result<Vec<TransparencyAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (anim_idx, anim) in animations.iter().enumerate() {
+        // Collect alpha track (f32 = 4 bytes)
+        if let Some(data) = collect_transparency_track_data(
+            reader,
+            &anim.alpha,
+            anim_idx,
+            TransparencyTrackType::Alpha,
+        )? {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Collects raw event track data for all events in the model
+///
+/// Events have two M2Arrays: ranges (per-animation timing) and times (timestamps).
+/// This is different from M2AnimationBlock - events are simpler trigger points.
+fn collect_event_data<R: Read + Seek>(reader: &mut R, events: &[M2Event]) -> Result<Vec<EventRaw>> {
+    let mut event_data = Vec::new();
+
+    for (event_idx, event) in events.iter().enumerate() {
+        // Skip events with no data
+        if event.ranges.count == 0 && event.times.count == 0 {
+            continue;
+        }
+
+        // Read ranges (8 bytes per range: start u32, end u32)
+        let ranges = if event.ranges.count > 0 {
+            read_raw_bytes(reader, &event.ranges.convert(), 8)?
+        } else {
+            Vec::new()
+        };
+
+        // Read timestamps (4 bytes per u32 timestamp)
+        let timestamps = if event.times.count > 0 {
+            read_raw_bytes(reader, &event.times.convert(), 4)?
+        } else {
+            Vec::new()
+        };
+
+        event_data.push(EventRaw {
+            event_index: event_idx,
+            ranges,
+            original_ranges_offset: event.ranges.offset,
+            timestamps,
+            original_timestamps_offset: event.times.offset,
+        });
+    }
+
+    Ok(event_data)
+}
+
+/// Collects raw keyframe data for a single attachment animation track
+fn collect_attachment_track_data<R: Read + Seek, T: M2Parse>(
+    reader: &mut R,
+    block: &M2AnimationBlock<T>,
+    attachment_index: usize,
+    track_type: AttachmentTrackType,
+) -> Result<Option<AttachmentAnimationRaw>> {
+    let track = &block.track;
+
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.array.is_empty() {
+        return Ok(None);
+    }
+
+    // Read interpolation ranges (8 bytes per range: start u32 + end u32)
+    let interpolation_ranges = if !track.interpolation_ranges.is_empty() {
+        read_raw_bytes(reader, &track.interpolation_ranges.convert(), 8)?
+    } else {
+        Vec::new()
+    };
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values (size depends on track type)
+    let values = if !track.values.array.is_empty() {
+        read_raw_bytes(
+            reader,
+            &track.values.array.convert(),
+            track_type.value_size(),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(AttachmentAnimationRaw {
+        attachment_index,
+        track_type,
+        interpolation_ranges,
+        timestamps,
+        values,
+        original_ranges_offset: track.interpolation_ranges.offset,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.array.offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all attachments in the model
+///
+/// This reads the actual keyframe bytes (interpolation_ranges, timestamps, values) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_attachment_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    attachments: &[M2Attachment],
+) -> Result<Vec<AttachmentAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (attach_idx, attachment) in attachments.iter().enumerate() {
+        // Collect scale track (f32 = 4 bytes)
+        if let Some(data) = collect_attachment_track_data(
+            reader,
+            &attachment.scale_animation,
+            attach_idx,
+            AttachmentTrackType::Scale,
+        )? {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Collects raw keyframe data for a single camera animation track
+fn collect_camera_track_data<R: Read + Seek, T: M2Parse>(
+    reader: &mut R,
+    block: &M2AnimationBlock<T>,
+    camera_index: usize,
+    track_type: CameraTrackType,
+) -> Result<Option<CameraAnimationRaw>> {
+    let track = &block.track;
+
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.array.is_empty() {
+        return Ok(None);
+    }
+
+    // Read interpolation ranges (8 bytes per range: start u32 + end u32)
+    let interpolation_ranges = if !track.interpolation_ranges.is_empty() {
+        read_raw_bytes(reader, &track.interpolation_ranges.convert(), 8)?
+    } else {
+        Vec::new()
+    };
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values (size depends on track type)
+    let values = if !track.values.array.is_empty() {
+        read_raw_bytes(
+            reader,
+            &track.values.array.convert(),
+            track_type.value_size(),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(CameraAnimationRaw {
+        camera_index,
+        track_type,
+        interpolation_ranges,
+        timestamps,
+        values,
+        original_ranges_offset: track.interpolation_ranges.offset,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.array.offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all cameras in the model
+///
+/// This reads the actual keyframe bytes (interpolation_ranges, timestamps, values) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_camera_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    cameras: &[M2Camera],
+) -> Result<Vec<CameraAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (camera_idx, camera) in cameras.iter().enumerate() {
+        // Collect position track (C3Vector = 12 bytes)
+        if let Some(data) = collect_camera_track_data(
+            reader,
+            &camera.position_animation,
+            camera_idx,
+            CameraTrackType::Position,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect target position track (C3Vector = 12 bytes)
+        if let Some(data) = collect_camera_track_data(
+            reader,
+            &camera.target_position_animation,
+            camera_idx,
+            CameraTrackType::TargetPosition,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect roll track (f32 = 4 bytes)
+        if let Some(data) = collect_camera_track_data(
+            reader,
+            &camera.roll_animation,
+            camera_idx,
+            CameraTrackType::Roll,
+        )? {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Collects raw keyframe data for a single light animation track
+fn collect_light_track_data<R: Read + Seek, T: M2Parse>(
+    reader: &mut R,
+    block: &M2AnimationBlock<T>,
+    light_index: usize,
+    track_type: LightTrackType,
+) -> Result<Option<LightAnimationRaw>> {
+    let track = &block.track;
+
+    // Skip empty tracks
+    if track.timestamps.is_empty() && track.values.array.is_empty() {
+        return Ok(None);
+    }
+
+    // Read interpolation ranges (8 bytes per range: start u32 + end u32)
+    let interpolation_ranges = if !track.interpolation_ranges.is_empty() {
+        read_raw_bytes(reader, &track.interpolation_ranges.convert(), 8)?
+    } else {
+        Vec::new()
+    };
+
+    // Read timestamps (4 bytes per timestamp)
+    let timestamps = if !track.timestamps.is_empty() {
+        read_raw_bytes(reader, &track.timestamps.convert(), 4)?
+    } else {
+        Vec::new()
+    };
+
+    // Read values (size depends on track type)
+    let values = if !track.values.array.is_empty() {
+        read_raw_bytes(
+            reader,
+            &track.values.array.convert(),
+            track_type.value_size(),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(LightAnimationRaw {
+        light_index,
+        track_type,
+        interpolation_ranges,
+        timestamps,
+        values,
+        original_ranges_offset: track.interpolation_ranges.offset,
+        original_timestamps_offset: track.timestamps.offset,
+        original_values_offset: track.values.array.offset,
+    }))
+}
+
+/// Collects raw animation keyframe data for all lights in the model
+///
+/// This reads the actual keyframe bytes (interpolation_ranges, timestamps, values) from the file,
+/// storing them for later serialization with offset relocation.
+fn collect_light_animation_data<R: Read + Seek>(
+    reader: &mut R,
+    lights: &[M2Light],
+) -> Result<Vec<LightAnimationRaw>> {
+    let mut animation_data = Vec::new();
+
+    for (light_idx, light) in lights.iter().enumerate() {
+        // Collect ambient color track (M2Color = 12 bytes: 3 × f32)
+        if let Some(data) = collect_light_track_data(
+            reader,
+            &light.ambient_color_animation,
+            light_idx,
+            LightTrackType::AmbientColor,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect diffuse color track (M2Color = 12 bytes: 3 × f32)
+        if let Some(data) = collect_light_track_data(
+            reader,
+            &light.diffuse_color_animation,
+            light_idx,
+            LightTrackType::DiffuseColor,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect attenuation start track (f32 = 4 bytes)
+        if let Some(data) = collect_light_track_data(
+            reader,
+            &light.attenuation_start_animation,
+            light_idx,
+            LightTrackType::AttenuationStart,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect attenuation end track (f32 = 4 bytes)
+        if let Some(data) = collect_light_track_data(
+            reader,
+            &light.attenuation_end_animation,
+            light_idx,
+            LightTrackType::AttenuationEnd,
+        )? {
+            animation_data.push(data);
+        }
+
+        // Collect visibility track (f32 = 4 bytes)
+        if let Some(data) = collect_light_track_data(
+            reader,
+            &light.visibility_animation,
+            light_idx,
+            LightTrackType::Visibility,
+        )? {
+            animation_data.push(data);
+        }
+    }
+
+    Ok(animation_data)
+}
+
+/// Collects raw embedded skin data for pre-WotLK M2 files (version <= 263)
+///
+/// Pre-WotLK models have skin profile data embedded directly in the M2 file.
+/// This function reads the ModelView structures and all data they reference.
+fn collect_embedded_skin_data<R: Read + Seek>(
+    reader: &mut R,
+    header: &M2Header,
+) -> Result<Vec<EmbeddedSkinRaw>> {
+    // Only pre-WotLK (version <= 263) has embedded skins
+    // Version 264+ uses external .skin files
+    if header.version > 263 {
+        return Ok(Vec::new());
+    }
+
+    // Check if views array has data
+    if header.views.count == 0 || header.views.offset == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut embedded_skins = Vec::new();
+    const MODEL_VIEW_SIZE: usize = 44; // 5 M2Arrays (8 bytes each) + 1 u32 = 44 bytes
+
+    // Submesh sizes vary by version
+    let submesh_size = if header.version < 260 { 32 } else { 48 };
+
+    // Read each ModelView structure
+    for view_idx in 0..header.views.count {
+        let model_view_offset = header.views.offset + (view_idx * MODEL_VIEW_SIZE as u32);
+
+        // Seek to and read the ModelView structure
+        reader.seek(SeekFrom::Start(model_view_offset as u64))?;
+        let mut model_view = vec![0u8; MODEL_VIEW_SIZE];
+        reader.read_exact(&mut model_view)?;
+
+        // Parse the M2Array offsets from ModelView
+        // Layout: indices(8) + triangles(8) + properties(8) + submeshes(8) + batches(8) + bone_count_max(4)
+        let n_indices =
+            u32::from_le_bytes([model_view[0], model_view[1], model_view[2], model_view[3]]);
+        let ofs_indices =
+            u32::from_le_bytes([model_view[4], model_view[5], model_view[6], model_view[7]]);
+
+        let n_triangles =
+            u32::from_le_bytes([model_view[8], model_view[9], model_view[10], model_view[11]]);
+        let ofs_triangles = u32::from_le_bytes([
+            model_view[12],
+            model_view[13],
+            model_view[14],
+            model_view[15],
+        ]);
+
+        let n_properties = u32::from_le_bytes([
+            model_view[16],
+            model_view[17],
+            model_view[18],
+            model_view[19],
+        ]);
+        let ofs_properties = u32::from_le_bytes([
+            model_view[20],
+            model_view[21],
+            model_view[22],
+            model_view[23],
+        ]);
+
+        let n_submeshes = u32::from_le_bytes([
+            model_view[24],
+            model_view[25],
+            model_view[26],
+            model_view[27],
+        ]);
+        let ofs_submeshes = u32::from_le_bytes([
+            model_view[28],
+            model_view[29],
+            model_view[30],
+            model_view[31],
+        ]);
+
+        let n_batches = u32::from_le_bytes([
+            model_view[32],
+            model_view[33],
+            model_view[34],
+            model_view[35],
+        ]);
+        let ofs_batches = u32::from_le_bytes([
+            model_view[36],
+            model_view[37],
+            model_view[38],
+            model_view[39],
+        ]);
+
+        // Read indices data (u16 per entry)
+        let indices = if n_indices > 0 && ofs_indices > 0 {
+            reader.seek(SeekFrom::Start(ofs_indices as u64))?;
+            let mut data = vec![0u8; n_indices as usize * 2];
+            reader.read_exact(&mut data)?;
+            data
+        } else {
+            Vec::new()
+        };
+
+        // Read triangles data (u16 per entry)
+        let triangles = if n_triangles > 0 && ofs_triangles > 0 {
+            reader.seek(SeekFrom::Start(ofs_triangles as u64))?;
+            let mut data = vec![0u8; n_triangles as usize * 2];
+            reader.read_exact(&mut data)?;
+            data
+        } else {
+            Vec::new()
+        };
+
+        // Read properties data (u8 or u16 per entry depending on version)
+        let properties = if n_properties > 0 && ofs_properties > 0 {
+            reader.seek(SeekFrom::Start(ofs_properties as u64))?;
+            // Properties are typically 4 bytes per entry (bone indices + padding)
+            let mut data = vec![0u8; n_properties as usize * 4];
+            reader.read_exact(&mut data)?;
+            data
+        } else {
+            Vec::new()
+        };
+
+        // Read submeshes data
+        let submeshes = if n_submeshes > 0 && ofs_submeshes > 0 {
+            reader.seek(SeekFrom::Start(ofs_submeshes as u64))?;
+            let mut data = vec![0u8; n_submeshes as usize * submesh_size];
+            reader.read_exact(&mut data)?;
+            data
+        } else {
+            Vec::new()
+        };
+
+        // Read batches/texture units data (24 bytes per entry)
+        // SkinBatch: 2 bytes (flags/priority) + 22 bytes (11 u16 fields) = 24 bytes
+        let batches = if n_batches > 0 && ofs_batches > 0 {
+            reader.seek(SeekFrom::Start(ofs_batches as u64))?;
+            let mut data = vec![0u8; n_batches as usize * 24];
+            reader.read_exact(&mut data)?;
+            data
+        } else {
+            Vec::new()
+        };
+
+        embedded_skins.push(EmbeddedSkinRaw {
+            model_view,
+            indices,
+            triangles,
+            properties,
+            submeshes,
+            batches,
+            original_model_view_offset: model_view_offset,
+            original_indices_offset: ofs_indices,
+            original_triangles_offset: ofs_triangles,
+            original_properties_offset: ofs_properties,
+            original_submeshes_offset: ofs_submeshes,
+            original_batches_offset: ofs_batches,
+        });
+    }
+
+    Ok(embedded_skins)
 }
 
 impl M2Format {
@@ -264,6 +2429,15 @@ impl Default for M2Model {
             vertices: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
+            particle_emitters: Vec::new(),
+            ribbon_emitters: Vec::new(),
+            texture_animations: Vec::new(),
+            color_animations: Vec::new(),
+            transparency_animations: Vec::new(),
+            events: Vec::new(),
+            attachments: Vec::new(),
+            cameras: Vec::new(),
+            lights: Vec::new(),
             raw_data: M2RawData::default(),
             skin_file_ids: None,
             animation_file_ids: None,
@@ -858,6 +3032,15 @@ impl M2Model {
             vertices: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
+            particle_emitters: Vec::new(),
+            ribbon_emitters: Vec::new(),
+            texture_animations: Vec::new(),
+            color_animations: Vec::new(),
+            transparency_animations: Vec::new(),
+            events: Vec::new(),
+            attachments: Vec::new(),
+            cameras: Vec::new(),
+            lights: Vec::new(),
             raw_data: M2RawData::default(),
             skin_file_ids: None,
             animation_file_ids: None,
@@ -1094,15 +3277,24 @@ impl M2Model {
 
         Ok(Self {
             header,
-            name: None,                   // TODO: Parse name from chunk-relative offset
-            global_sequences: Vec::new(), // TODO: Parse from chunk
-            animations: Vec::new(),       // TODO: Parse from chunk
-            animation_lookup: Vec::new(), // TODO: Parse from chunk
-            bones: Vec::new(),            // TODO: Parse from chunk
-            key_bone_lookup: Vec::new(),  // TODO: Parse from chunk
-            vertices: Vec::new(),         // TODO: Parse from chunk
-            textures: Vec::new(),         // TODO: Parse from chunk
-            materials: Vec::new(),        // TODO: Parse from chunk
+            name: None,                     // TODO: Parse name from chunk-relative offset
+            global_sequences: Vec::new(),   // TODO: Parse from chunk
+            animations: Vec::new(),         // TODO: Parse from chunk
+            animation_lookup: Vec::new(),   // TODO: Parse from chunk
+            bones: Vec::new(),              // TODO: Parse from chunk
+            key_bone_lookup: Vec::new(),    // TODO: Parse from chunk
+            vertices: Vec::new(),           // TODO: Parse from chunk
+            textures: Vec::new(),           // TODO: Parse from chunk
+            materials: Vec::new(),          // TODO: Parse from chunk
+            particle_emitters: Vec::new(),  // TODO: Parse from chunk
+            ribbon_emitters: Vec::new(),    // TODO: Parse from chunk
+            texture_animations: Vec::new(), // TODO: Parse from chunk
+            color_animations: Vec::new(),   // TODO: Parse from chunk
+            transparency_animations: Vec::new(), // TODO: Parse from chunk
+            events: Vec::new(),             // TODO: Parse from chunk
+            attachments: Vec::new(),
+            cameras: Vec::new(),
+            lights: Vec::new(), // TODO: Parse from chunk
             raw_data: M2RawData::default(),
             skin_file_ids: None,              // Will be populated from SFID chunk
             animation_file_ids: None,         // Will be populated from AFID chunk
@@ -1230,9 +3422,101 @@ impl M2Model {
             M2Material::parse(r, header.version)
         })?;
 
+        // Parse particle emitters
+        let particle_emitters = read_array(reader, &header.particle_emitters.convert(), |r| {
+            M2ParticleEmitter::parse(r, header.version)
+        })?;
+
+        // Parse ribbon emitters
+        let ribbon_emitters = read_array(reader, &header.ribbon_emitters.convert(), |r| {
+            M2RibbonEmitter::parse(r, header.version)
+        })?;
+
+        // Parse texture animations
+        let texture_animations = read_array(reader, &header.texture_animations.convert(), |r| {
+            M2TextureAnimation::parse(r)
+        })?;
+
+        // Parse color animations
+        let color_animations = read_array(reader, &header.color_animations.convert(), |r| {
+            M2ColorAnimation::parse(r)
+        })?;
+
+        // Parse transparency animations (stored in header.transparency_lookup field,
+        // which despite its name contains M2TransparencyAnimation structures, not lookup indices)
+        let transparency_animations =
+            read_array(reader, &header.transparency_lookup.convert(), |r| {
+                M2TransparencyAnimation::parse(r)
+            })?;
+
+        // Parse events (timeline triggers for sounds, effects, etc.)
+        let events = read_array(reader, &header.events.convert(), |r| {
+            M2Event::parse(r, header.version)
+        })?;
+
+        // Parse attachments (attach points for weapons, effects, etc.)
+        let attachments = read_array(reader, &header.attachments.convert(), |r| {
+            M2Attachment::parse(r, header.version)
+        })?;
+
+        // Parse cameras
+        let cameras = read_array(reader, &header.cameras.convert(), |r| {
+            M2Camera::parse(r, header.version)
+        })?;
+
+        // Parse lights
+        let lights = read_array(reader, &header.lights.convert(), |r| {
+            M2Light::parse(r, header.version)
+        })?;
+
+        // Collect raw animation keyframe data for bones before constructing raw_data
+        let bone_animation_data = collect_bone_animation_data(reader, &bones, header.version)?;
+
+        // Collect raw animation keyframe data for particle emitters
+        let particle_animation_data = collect_particle_animation_data(reader, &particle_emitters)?;
+
+        // Collect raw animation keyframe data for ribbon emitters
+        let ribbon_animation_data = collect_ribbon_animation_data(reader, &ribbon_emitters)?;
+
+        // Collect raw animation keyframe data for texture animations
+        let texture_animation_data = collect_texture_animation_data(reader, &texture_animations)?;
+
+        // Collect raw animation keyframe data for color animations
+        let color_animation_data = collect_color_animation_data(reader, &color_animations)?;
+
+        // Collect raw animation keyframe data for transparency animations
+        let transparency_animation_data =
+            collect_transparency_animation_data(reader, &transparency_animations)?;
+
+        // Collect raw event track data
+        let event_data = collect_event_data(reader, &events)?;
+
+        // Collect raw animation keyframe data for attachments
+        let attachment_animation_data = collect_attachment_animation_data(reader, &attachments)?;
+
+        // Collect raw animation keyframe data for cameras
+        let camera_animation_data = collect_camera_animation_data(reader, &cameras)?;
+
+        // Collect raw animation keyframe data for lights
+        let light_animation_data = collect_light_animation_data(reader, &lights)?;
+
+        // Collect embedded skin data for pre-WotLK models (version <= 263)
+        let embedded_skins = collect_embedded_skin_data(reader, &header)?;
+
         // Parse raw data for other sections
         // These are sections we won't fully parse yet but want to preserve
         let raw_data = M2RawData {
+            bone_animation_data,
+            embedded_skins,
+            particle_animation_data,
+            ribbon_animation_data,
+            texture_animation_data,
+            color_animation_data,
+            transparency_animation_data,
+            event_data,
+            attachment_animation_data,
+            camera_animation_data,
+            light_animation_data,
             transparency_lookup_table: read_array(
                 reader,
                 &header.transparency_lookup_table,
@@ -1251,6 +3535,14 @@ impl M2Model {
             camera_lookup_table: read_array(reader, &header.camera_lookup_table, |r| {
                 Ok(r.read_u16_le()?)
             })?,
+            // Bounding data - read as raw bytes for preservation during conversion
+            bounding_triangles: read_raw_bytes(reader, &header.bounding_triangles, 2)?, // u16 indices
+            bounding_vertices: read_raw_bytes(reader, &header.bounding_vertices, 12)?,  // C3Vector
+            bounding_normals: read_raw_bytes(reader, &header.bounding_normals, 12)?,    // C3Vector
+            // Attachment lookup table
+            attachment_lookup_table: read_array(reader, &header.attachment_lookup_table, |r| {
+                Ok(r.read_u16_le()?)
+            })?,
             ..Default::default()
         };
 
@@ -1265,6 +3557,15 @@ impl M2Model {
             vertices,
             textures,
             materials,
+            particle_emitters,
+            ribbon_emitters,
+            texture_animations,
+            color_animations,
+            transparency_animations,
+            events,
+            attachments,
+            cameras,
+            lights,
             raw_data,
             skin_file_ids: None,
             animation_file_ids: None,
@@ -1360,8 +3661,8 @@ impl M2Model {
                 data_section.extend_from_slice(&anim_data);
             }
 
-            // Animation size depends on version: 24 bytes for Classic, 52 bytes for BC+
-            let anim_size = if header.version <= 256 { 24 } else { 52 };
+            // Animation size depends on version: 32 bytes for Classic, 52 bytes for BC+
+            let anim_size = if header.version <= 256 { 32 } else { 52 };
             current_offset += (self.animations.len() * anim_size) as u32;
         } else {
             header.animations = M2Array::new(0, 0);
@@ -1381,19 +3682,116 @@ impl M2Model {
             header.animation_lookup = M2Array::new(0, 0);
         }
 
-        // Write bones
+        // Write bones with animation data preservation
+        // If we have collected bone animation data, write it with relocated offsets.
+        // Otherwise, write static bones (zeroed animation tracks).
         if !self.bones.is_empty() {
             header.bones = M2Array::new(self.bones.len() as u32, current_offset);
 
-            for bone in &self.bones {
-                let mut bone_data = Vec::new();
-                bone.write(&mut bone_data, self.header.version)?;
-                data_section.extend_from_slice(&bone_data);
-            }
+            // Calculate bone structure size based on version
+            let bone_size = if header.version < 260 {
+                108 // Vanilla: no boneNameCRC, 28-byte M2Tracks
+            } else if header.version < 264 {
+                112 // TBC: boneNameCRC, 28-byte M2Tracks
+            } else {
+                88 // WotLK+: boneNameCRC, 20-byte M2Tracks (no ranges)
+            };
 
-            // Bone size is 92 bytes for all versions we support
-            let bone_size = 92;
-            current_offset += (self.bones.len() * bone_size) as u32;
+            // Calculate where animation data will be written (after all bone structures)
+            let bones_total_size = self.bones.len() * bone_size;
+            let anim_data_start = current_offset + bones_total_size as u32;
+
+            // Check if we have animation data to preserve
+            if !self.raw_data.bone_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                // Multiple bones can share animation data (same original offset).
+                // We only write shared data once and reuse the same new offset.
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut anim_data_offset = anim_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.bone_animation_data {
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.values.len() as u32;
+                    }
+
+                    // Map ranges offset (pre-WotLK only, skip if already mapped)
+                    if let (Some(ranges), Some(orig_offset)) =
+                        (&anim.ranges, anim.original_ranges_offset)
+                        && let Entry::Vacant(e) = offset_map.entry(orig_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += ranges.len() as u32;
+                    }
+                }
+
+                // Write bones with relocated offsets
+                for bone in &self.bones {
+                    let mut relocated_bone = bone.clone();
+                    relocate_bone_track_offsets(&mut relocated_bone, &offset_map);
+
+                    let mut bone_data = Vec::new();
+                    relocated_bone.write(&mut bone_data, header.version)?;
+                    data_section.extend_from_slice(&bone_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.bone_animation_data {
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+
+                    // Write ranges only if not already written
+                    if let (Some(ranges), Some(orig_offset)) =
+                        (&anim.ranges, anim.original_ranges_offset)
+                        && written_offsets.insert(orig_offset)
+                    {
+                        data_section.extend_from_slice(ranges);
+                    }
+                }
+
+                current_offset = anim_data_offset;
+            } else {
+                // No animation data collected - write static bones (zeroed tracks)
+                for bone in &self.bones {
+                    let mut static_bone = bone.clone();
+                    static_bone.translation = M2TrackVec3::default();
+                    static_bone.rotation = M2TrackQuat::default();
+                    static_bone.scale = M2TrackVec3::default();
+
+                    let mut bone_data = Vec::new();
+                    static_bone.write(&mut bone_data, header.version)?;
+                    data_section.extend_from_slice(&bone_data);
+                }
+
+                current_offset += bones_total_size as u32;
+            }
         } else {
             header.bones = M2Array::new(0, 0);
         }
@@ -1416,18 +3814,14 @@ impl M2Model {
         if !self.vertices.is_empty() {
             header.vertices = M2Array::new(self.vertices.len() as u32, current_offset);
 
-            let vertex_size =
-                if self.header.version().unwrap_or(M2Version::Vanilla) >= M2Version::Cataclysm {
-                    // Cataclysm and later have secondary texture coordinates
-                    44
-                } else {
-                    // Pre-Cataclysm don't have secondary texture coordinates
-                    36
-                };
+            // Vertex size is always 48 bytes for all versions:
+            // position (12) + bone_weights (4) + bone_indices (4) + normal (12) + tex_coords (8) + tex_coords2 (8)
+            // Note: Secondary texture coordinates exist in ALL M2 versions (verified against vanilla files).
+            let vertex_size = 48;
 
             for vertex in &self.vertices {
                 let mut vertex_data = Vec::new();
-                vertex.write(&mut vertex_data, self.header.version)?;
+                vertex.write(&mut vertex_data, header.version)?;
                 data_section.extend_from_slice(&vertex_data);
             }
 
@@ -1507,17 +3901,12 @@ impl M2Model {
 
             for material in &self.materials {
                 let mut material_data = Vec::new();
-                material.write(&mut material_data, self.header.version)?;
+                material.write(&mut material_data, header.version)?;
                 data_section.extend_from_slice(&material_data);
             }
 
-            let material_size = match self.header.version().unwrap_or(M2Version::Vanilla) {
-                v if v >= M2Version::WoD => 18, // WoD and later have color animation lookup
-                v if v >= M2Version::Cataclysm => 16, // Cataclysm and later have shader ID and secondary texture unit
-                _ => 12,                              // Classic to WotLK
-            };
-
-            current_offset += (self.materials.len() * material_size) as u32;
+            // Material is always 4 bytes: flags (u16) + blending_mode (u16)
+            current_offset += (self.materials.len() * 4) as u32;
         } else {
             header.render_flags = M2Array::new(0, 0);
         }
@@ -1597,11 +3986,1235 @@ impl M2Model {
                 data_section.extend_from_slice(&lookup.to_le_bytes());
             }
 
-            // current_offset +=
-            //     (self.raw_data.texture_animation_lookup.len() * std::mem::size_of::<u16>()) as u32;
+            current_offset +=
+                (self.raw_data.texture_animation_lookup.len() * std::mem::size_of::<u16>()) as u32;
         } else {
             header.texture_animation_lookup = M2Array::new(0, 0);
         }
+
+        // Write bounding triangles
+        if !self.raw_data.bounding_triangles.is_empty() {
+            // bounding_triangles count is number of u16 values (3 per triangle)
+            let count = self.raw_data.bounding_triangles.len() / 2;
+            header.bounding_triangles = M2Array::new(count as u32, current_offset);
+            data_section.extend_from_slice(&self.raw_data.bounding_triangles);
+            current_offset += self.raw_data.bounding_triangles.len() as u32;
+        } else {
+            header.bounding_triangles = M2Array::new(0, 0);
+        }
+
+        // Write bounding vertices
+        if !self.raw_data.bounding_vertices.is_empty() {
+            // bounding_vertices are C3Vector (12 bytes each)
+            let count = self.raw_data.bounding_vertices.len() / 12;
+            header.bounding_vertices = M2Array::new(count as u32, current_offset);
+            data_section.extend_from_slice(&self.raw_data.bounding_vertices);
+            current_offset += self.raw_data.bounding_vertices.len() as u32;
+        } else {
+            header.bounding_vertices = M2Array::new(0, 0);
+        }
+
+        // Write bounding normals
+        if !self.raw_data.bounding_normals.is_empty() {
+            // bounding_normals are C3Vector (12 bytes each)
+            let count = self.raw_data.bounding_normals.len() / 12;
+            header.bounding_normals = M2Array::new(count as u32, current_offset);
+            data_section.extend_from_slice(&self.raw_data.bounding_normals);
+            current_offset += self.raw_data.bounding_normals.len() as u32;
+        } else {
+            header.bounding_normals = M2Array::new(0, 0);
+        }
+
+        // Write attachment lookup table
+        if !self.raw_data.attachment_lookup_table.is_empty() {
+            header.attachment_lookup_table = M2Array::new(
+                self.raw_data.attachment_lookup_table.len() as u32,
+                current_offset,
+            );
+            for &lookup in &self.raw_data.attachment_lookup_table {
+                data_section.extend_from_slice(&lookup.to_le_bytes());
+            }
+            current_offset +=
+                (self.raw_data.attachment_lookup_table.len() * std::mem::size_of::<u16>()) as u32;
+        } else {
+            header.attachment_lookup_table = M2Array::new(0, 0);
+        }
+
+        // Write camera lookup table
+        if !self.raw_data.camera_lookup_table.is_empty() {
+            header.camera_lookup_table = M2Array::new(
+                self.raw_data.camera_lookup_table.len() as u32,
+                current_offset,
+            );
+            for &lookup in &self.raw_data.camera_lookup_table {
+                data_section.extend_from_slice(&lookup.to_le_bytes());
+            }
+            current_offset +=
+                (self.raw_data.camera_lookup_table.len() * std::mem::size_of::<u16>()) as u32;
+        } else {
+            header.camera_lookup_table = M2Array::new(0, 0);
+        }
+
+        // Write embedded skin data for pre-WotLK versions (version <= 263)
+        if header.version <= 263 && !self.raw_data.embedded_skins.is_empty() {
+            // Calculate total size needed for all embedded skin data:
+            // 1. ModelView structures (44 bytes each)
+            // 2. All referenced data arrays (indices, triangles, properties, submeshes, batches)
+
+            const MODEL_VIEW_SIZE: u32 = 44;
+            let model_view_count = self.raw_data.embedded_skins.len() as u32;
+
+            // Header.views points to the ModelView structures
+            let model_views_offset = current_offset;
+            header.views = M2Array::new(model_view_count, model_views_offset);
+
+            // Phase 1: Calculate all new offsets for all skins before writing anything
+            let mut data_offset = model_views_offset + (model_view_count * MODEL_VIEW_SIZE);
+            let submesh_size = if header.version < 260 { 32 } else { 48 };
+
+            // Store calculated offsets for each skin
+            struct SkinOffsets {
+                indices_offset: u32,
+                triangles_offset: u32,
+                properties_offset: u32,
+                submeshes_offset: u32,
+                batches_offset: u32,
+            }
+
+            let mut all_offsets = Vec::with_capacity(self.raw_data.embedded_skins.len());
+
+            for skin in &self.raw_data.embedded_skins {
+                let indices_offset = if skin.indices.is_empty() {
+                    0
+                } else {
+                    let offset = data_offset;
+                    data_offset += skin.indices.len() as u32;
+                    offset
+                };
+
+                let triangles_offset = if skin.triangles.is_empty() {
+                    0
+                } else {
+                    let offset = data_offset;
+                    data_offset += skin.triangles.len() as u32;
+                    offset
+                };
+
+                let properties_offset = if skin.properties.is_empty() {
+                    0
+                } else {
+                    let offset = data_offset;
+                    data_offset += skin.properties.len() as u32;
+                    offset
+                };
+
+                let submeshes_offset = if skin.submeshes.is_empty() {
+                    0
+                } else {
+                    let offset = data_offset;
+                    data_offset += skin.submeshes.len() as u32;
+                    offset
+                };
+
+                let batches_offset = if skin.batches.is_empty() {
+                    0
+                } else {
+                    let offset = data_offset;
+                    data_offset += skin.batches.len() as u32;
+                    offset
+                };
+
+                all_offsets.push(SkinOffsets {
+                    indices_offset,
+                    triangles_offset,
+                    properties_offset,
+                    submeshes_offset,
+                    batches_offset,
+                });
+            }
+
+            // Phase 2: Write all ModelView structures with calculated offsets
+            for (skin, offsets) in self.raw_data.embedded_skins.iter().zip(all_offsets.iter()) {
+                // Calculate counts from data sizes
+                let n_indices = (skin.indices.len() / 2) as u32;
+                let n_triangles = (skin.triangles.len() / 2) as u32;
+                let n_properties = (skin.properties.len() / 4) as u32;
+                let n_submeshes = if skin.submeshes.is_empty() {
+                    0
+                } else {
+                    (skin.submeshes.len() / submesh_size) as u32
+                };
+                let n_batches = (skin.batches.len() / 96) as u32;
+
+                // Extract bone_count_max from original ModelView (last 4 bytes)
+                let bone_count_max = if skin.model_view.len() >= 44 {
+                    u32::from_le_bytes([
+                        skin.model_view[40],
+                        skin.model_view[41],
+                        skin.model_view[42],
+                        skin.model_view[43],
+                    ])
+                } else {
+                    0
+                };
+
+                // Write ModelView structure (44 bytes: 5 M2Arrays + bone_count_max)
+                data_section.extend_from_slice(&n_indices.to_le_bytes());
+                data_section.extend_from_slice(&offsets.indices_offset.to_le_bytes());
+                data_section.extend_from_slice(&n_triangles.to_le_bytes());
+                data_section.extend_from_slice(&offsets.triangles_offset.to_le_bytes());
+                data_section.extend_from_slice(&n_properties.to_le_bytes());
+                data_section.extend_from_slice(&offsets.properties_offset.to_le_bytes());
+                data_section.extend_from_slice(&n_submeshes.to_le_bytes());
+                data_section.extend_from_slice(&offsets.submeshes_offset.to_le_bytes());
+                data_section.extend_from_slice(&n_batches.to_le_bytes());
+                data_section.extend_from_slice(&offsets.batches_offset.to_le_bytes());
+                data_section.extend_from_slice(&bone_count_max.to_le_bytes());
+            }
+
+            // Phase 3: Write all data arrays in the same order as offsets were calculated
+            for skin in &self.raw_data.embedded_skins {
+                if !skin.indices.is_empty() {
+                    data_section.extend_from_slice(&skin.indices);
+                }
+                if !skin.triangles.is_empty() {
+                    data_section.extend_from_slice(&skin.triangles);
+                }
+                if !skin.properties.is_empty() {
+                    data_section.extend_from_slice(&skin.properties);
+                }
+                if !skin.submeshes.is_empty() {
+                    data_section.extend_from_slice(&skin.submeshes);
+                }
+                if !skin.batches.is_empty() {
+                    data_section.extend_from_slice(&skin.batches);
+                }
+            }
+
+            current_offset = data_offset;
+        }
+
+        // Write particle emitters with animation data preservation
+        // Similar pattern to bones - write structures with relocated offsets, then animation data
+        if !self.particle_emitters.is_empty() {
+            header.particle_emitters =
+                M2Array::new(self.particle_emitters.len() as u32, current_offset);
+
+            // First, write all emitter structures to a temporary buffer to calculate their total size
+            let mut temp_emitter_data = Vec::new();
+            for emitter in &self.particle_emitters {
+                let mut emitter_data = Vec::new();
+                emitter.write(&mut emitter_data, header.version)?;
+                temp_emitter_data.push(emitter_data);
+            }
+            let emitters_total_size: usize = temp_emitter_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where animation data will be written (after all emitter structures)
+            let anim_data_start = current_offset + emitters_total_size as u32;
+
+            // Check if we have animation data to preserve
+            if !self.raw_data.particle_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut anim_data_offset = anim_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.particle_animation_data {
+                    // Map interpolation_ranges offset (skip if already mapped - shared data)
+                    if !anim.interpolation_ranges.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_ranges_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.interpolation_ranges.len() as u32;
+                    }
+
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.values.len() as u32;
+                    }
+                }
+
+                // Write emitters with relocated offsets
+                for emitter in &self.particle_emitters {
+                    let mut relocated_emitter = emitter.clone();
+                    relocate_particle_animation_offsets(&mut relocated_emitter, &offset_map);
+
+                    let mut emitter_data = Vec::new();
+                    relocated_emitter.write(&mut emitter_data, header.version)?;
+                    data_section.extend_from_slice(&emitter_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.particle_animation_data {
+                    // Write interpolation_ranges only if not already written
+                    if !anim.interpolation_ranges.is_empty()
+                        && written_offsets.insert(anim.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&anim.interpolation_ranges);
+                    }
+
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+                }
+
+                current_offset = anim_data_offset;
+            } else {
+                // No animation data collected - write emitters with zeroed animation tracks
+                // This happens when we're creating new emitters or the source had no animations
+                for emitter in &self.particle_emitters {
+                    let mut static_emitter = emitter.clone();
+                    // Zero out all animation blocks by setting them to default
+                    static_emitter.emission_speed_animation = M2AnimationBlock::default();
+                    static_emitter.emission_rate_animation = M2AnimationBlock::default();
+                    static_emitter.emission_area_animation = M2AnimationBlock::default();
+                    static_emitter.xy_scale_animation = M2AnimationBlock::default();
+                    static_emitter.z_scale_animation = M2AnimationBlock::default();
+                    static_emitter.color_animation = M2AnimationBlock::default();
+                    static_emitter.transparency_animation = M2AnimationBlock::default();
+                    static_emitter.size_animation = M2AnimationBlock::default();
+                    static_emitter.intensity_animation = M2AnimationBlock::default();
+                    static_emitter.z_source_animation = M2AnimationBlock::default();
+
+                    let mut emitter_data = Vec::new();
+                    static_emitter.write(&mut emitter_data, header.version)?;
+                    data_section.extend_from_slice(&emitter_data);
+                }
+
+                current_offset += emitters_total_size as u32;
+            }
+        } else {
+            header.particle_emitters = M2Array::new(0, 0);
+        }
+
+        // Write ribbon emitters with animation data preservation
+        // Similar pattern to particle emitters - write structures with relocated offsets, then animation data
+        if !self.ribbon_emitters.is_empty() {
+            header.ribbon_emitters =
+                M2Array::new(self.ribbon_emitters.len() as u32, current_offset);
+
+            // First, write all emitter structures to a temporary buffer to calculate their total size
+            let mut temp_emitter_data = Vec::new();
+            for emitter in &self.ribbon_emitters {
+                let mut emitter_data = Vec::new();
+                emitter.write(&mut emitter_data, header.version)?;
+                temp_emitter_data.push(emitter_data);
+            }
+            let emitters_total_size: usize = temp_emitter_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where animation data will be written (after all emitter structures)
+            let anim_data_start = current_offset + emitters_total_size as u32;
+
+            // Check if we have animation data to preserve
+            if !self.raw_data.ribbon_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut anim_data_offset = anim_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.ribbon_animation_data {
+                    // Map interpolation_ranges offset (skip if already mapped - shared data)
+                    if !anim.interpolation_ranges.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_ranges_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.interpolation_ranges.len() as u32;
+                    }
+
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.values.len() as u32;
+                    }
+                }
+
+                // Write emitters with relocated offsets
+                for emitter in &self.ribbon_emitters {
+                    let mut relocated_emitter = emitter.clone();
+                    relocate_ribbon_animation_offsets(&mut relocated_emitter, &offset_map);
+
+                    let mut emitter_data = Vec::new();
+                    relocated_emitter.write(&mut emitter_data, header.version)?;
+                    data_section.extend_from_slice(&emitter_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.ribbon_animation_data {
+                    // Write interpolation_ranges only if not already written
+                    if !anim.interpolation_ranges.is_empty()
+                        && written_offsets.insert(anim.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&anim.interpolation_ranges);
+                    }
+
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+                }
+
+                current_offset = anim_data_offset;
+            } else {
+                // No animation data collected - write emitters with zeroed animation tracks
+                // This happens when we're creating new emitters or the source had no animations
+                for emitter in &self.ribbon_emitters {
+                    let mut static_emitter = emitter.clone();
+                    // Zero out all animation blocks by setting them to default
+                    static_emitter.color_animation = M2AnimationBlock::default();
+                    static_emitter.alpha_animation = M2AnimationBlock::default();
+                    static_emitter.height_above_animation = M2AnimationBlock::default();
+                    static_emitter.height_below_animation = M2AnimationBlock::default();
+
+                    let mut emitter_data = Vec::new();
+                    static_emitter.write(&mut emitter_data, header.version)?;
+                    data_section.extend_from_slice(&emitter_data);
+                }
+
+                current_offset += emitters_total_size as u32;
+            }
+        } else {
+            header.ribbon_emitters = M2Array::new(0, 0);
+        }
+
+        // Write texture animations with animation data preservation
+        // Similar pattern to particle/ribbon emitters - write structures with relocated offsets, then animation data
+        if !self.texture_animations.is_empty() {
+            header.texture_animations =
+                M2Array::new(self.texture_animations.len() as u32, current_offset);
+
+            // First, write all animation structures to a temporary buffer to calculate their total size
+            let mut temp_anim_data = Vec::new();
+            for anim in &self.texture_animations {
+                let mut anim_data = Vec::new();
+                anim.write(&mut anim_data)?;
+                temp_anim_data.push(anim_data);
+            }
+            let anims_total_size: usize = temp_anim_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where animation data will be written (after all animation structures)
+            let anim_data_start = current_offset + anims_total_size as u32;
+
+            // Check if we have animation data to preserve
+            if !self.raw_data.texture_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut anim_data_offset = anim_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.texture_animation_data {
+                    // Map interpolation_ranges offset (skip if already mapped - shared data)
+                    if !anim.interpolation_ranges.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_ranges_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.interpolation_ranges.len() as u32;
+                    }
+
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.values.len() as u32;
+                    }
+                }
+
+                // Write animations with relocated offsets
+                for anim in &self.texture_animations {
+                    let mut relocated_anim = anim.clone();
+                    relocate_texture_animation_offsets(&mut relocated_anim, &offset_map);
+
+                    let mut anim_data = Vec::new();
+                    relocated_anim.write(&mut anim_data)?;
+                    data_section.extend_from_slice(&anim_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.texture_animation_data {
+                    // Write interpolation_ranges only if not already written
+                    if !anim.interpolation_ranges.is_empty()
+                        && written_offsets.insert(anim.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&anim.interpolation_ranges);
+                    }
+
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+                }
+
+                current_offset = anim_data_offset;
+            } else {
+                // No animation data collected - write animations with zeroed animation tracks
+                // This happens when we're creating new animations or the source had no keyframes
+                for anim in &self.texture_animations {
+                    let mut static_anim = anim.clone();
+                    // Zero out all animation blocks by setting them to default
+                    static_anim.translation_u = M2AnimationBlock::default();
+                    static_anim.translation_v = M2AnimationBlock::default();
+                    static_anim.rotation = M2AnimationBlock::default();
+                    static_anim.scale_u = M2AnimationBlock::default();
+                    static_anim.scale_v = M2AnimationBlock::default();
+
+                    let mut anim_data = Vec::new();
+                    static_anim.write(&mut anim_data)?;
+                    data_section.extend_from_slice(&anim_data);
+                }
+
+                current_offset += anims_total_size as u32;
+            }
+        } else {
+            header.texture_animations = M2Array::new(0, 0);
+        }
+
+        // Write color animations with animation data preservation
+        // Similar pattern to texture animations - write structures with relocated offsets, then animation data
+        if !self.color_animations.is_empty() {
+            header.color_animations =
+                M2Array::new(self.color_animations.len() as u32, current_offset);
+
+            // First, write all animation structures to a temporary buffer to calculate their total size
+            let mut temp_anim_data = Vec::new();
+            for anim in &self.color_animations {
+                let mut anim_data = Vec::new();
+                anim.write(&mut anim_data)?;
+                temp_anim_data.push(anim_data);
+            }
+            let anims_total_size: usize = temp_anim_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where animation data will be written (after all animation structures)
+            let anim_data_start = current_offset + anims_total_size as u32;
+
+            // Check if we have animation data to preserve
+            if !self.raw_data.color_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut anim_data_offset = anim_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.color_animation_data {
+                    // Map interpolation_ranges offset (skip if already mapped - shared data)
+                    if !anim.interpolation_ranges.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_ranges_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.interpolation_ranges.len() as u32;
+                    }
+
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.values.len() as u32;
+                    }
+                }
+
+                // Write animations with relocated offsets
+                for anim in &self.color_animations {
+                    let mut relocated_anim = anim.clone();
+                    relocate_color_animation_offsets(&mut relocated_anim, &offset_map);
+
+                    let mut anim_data = Vec::new();
+                    relocated_anim.write(&mut anim_data)?;
+                    data_section.extend_from_slice(&anim_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.color_animation_data {
+                    // Write interpolation_ranges only if not already written
+                    if !anim.interpolation_ranges.is_empty()
+                        && written_offsets.insert(anim.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&anim.interpolation_ranges);
+                    }
+
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+                }
+
+                current_offset = anim_data_offset;
+            } else {
+                // No animation data collected - write animations with zeroed animation tracks
+                for anim in &self.color_animations {
+                    let mut static_anim = anim.clone();
+                    // Zero out all animation blocks by setting them to default
+                    static_anim.color = M2AnimationBlock::default();
+                    static_anim.alpha = M2AnimationBlock::default();
+
+                    let mut anim_data = Vec::new();
+                    static_anim.write(&mut anim_data)?;
+                    data_section.extend_from_slice(&anim_data);
+                }
+
+                current_offset += anims_total_size as u32;
+            }
+        } else {
+            header.color_animations = M2Array::new(0, 0);
+        }
+
+        // Write transparency animations with animation data preservation
+        // Note: header.transparency_lookup field contains M2TransparencyAnimation structures
+        if !self.transparency_animations.is_empty() {
+            header.transparency_lookup =
+                M2Array::new(self.transparency_animations.len() as u32, current_offset);
+
+            // First, write all animation structures to a temporary buffer to calculate their total size
+            let mut temp_anim_data = Vec::new();
+            for anim in &self.transparency_animations {
+                let mut anim_data = Vec::new();
+                anim.write(&mut anim_data)?;
+                temp_anim_data.push(anim_data);
+            }
+            let anims_total_size: usize = temp_anim_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where animation data will be written (after all animation structures)
+            let anim_data_start = current_offset + anims_total_size as u32;
+
+            // Check if we have animation data to preserve
+            if !self.raw_data.transparency_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut anim_data_offset = anim_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.transparency_animation_data {
+                    // Map interpolation_ranges offset (skip if already mapped - shared data)
+                    if !anim.interpolation_ranges.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_ranges_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.interpolation_ranges.len() as u32;
+                    }
+
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(anim_data_offset);
+                        anim_data_offset += anim.values.len() as u32;
+                    }
+                }
+
+                // Write animations with relocated offsets
+                for anim in &self.transparency_animations {
+                    let mut relocated_anim = anim.clone();
+                    relocate_transparency_animation_offsets(&mut relocated_anim, &offset_map);
+
+                    let mut anim_data = Vec::new();
+                    relocated_anim.write(&mut anim_data)?;
+                    data_section.extend_from_slice(&anim_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.transparency_animation_data {
+                    // Write interpolation_ranges only if not already written
+                    if !anim.interpolation_ranges.is_empty()
+                        && written_offsets.insert(anim.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&anim.interpolation_ranges);
+                    }
+
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+                }
+
+                current_offset = anim_data_offset;
+            } else {
+                // No animation data collected - write animations with zeroed animation tracks
+                for anim in &self.transparency_animations {
+                    let mut static_anim = anim.clone();
+                    // Zero out all animation blocks by setting them to default
+                    static_anim.alpha = M2AnimationBlock::default();
+
+                    let mut anim_data = Vec::new();
+                    static_anim.write(&mut anim_data)?;
+                    data_section.extend_from_slice(&anim_data);
+                }
+
+                current_offset += anims_total_size as u32;
+            }
+        } else {
+            header.transparency_lookup = M2Array::new(0, 0);
+        }
+
+        // ==============================
+        // EVENTS SECTION
+        // ==============================
+        // Events are timeline triggers (sounds, effects) using simple M2Array<u32> for timestamps
+        if !self.events.is_empty() {
+            // Calculate offset from actual data_section length, not tracked current_offset
+            let event_offset = self.calculate_header_size() + data_section.len();
+            header.events = M2Array::new(self.events.len() as u32, event_offset as u32);
+
+            // First, write all event structures to a temporary buffer to calculate their total size
+            let mut temp_event_data = Vec::new();
+            for event in &self.events {
+                let mut event_data = Vec::new();
+                event.write(&mut event_data, header.version)?;
+                temp_event_data.push(event_data);
+            }
+            let events_total_size: usize = temp_event_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where event timestamp data will be written (after all event structures)
+            let event_data_start = current_offset + events_total_size as u32;
+
+            // Check if we have event data to preserve
+            if !self.raw_data.event_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut event_data_offset = event_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for event_raw in &self.raw_data.event_data {
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !event_raw.timestamps.is_empty()
+                        && let Entry::Vacant(e) =
+                            offset_map.entry(event_raw.original_timestamps_offset)
+                    {
+                        e.insert(event_data_offset);
+                        event_data_offset += event_raw.timestamps.len() as u32;
+                    }
+                }
+
+                // Write events with relocated offsets
+                for event in &self.events {
+                    let mut relocated_event = event.clone();
+                    relocate_event_offset(&mut relocated_event, &offset_map);
+
+                    let mut event_data = Vec::new();
+                    relocated_event.write(&mut event_data, header.version)?;
+                    data_section.extend_from_slice(&event_data);
+                }
+
+                // Write event data (ranges and timestamps, only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for event_raw in &self.raw_data.event_data {
+                    // Write ranges if not already written
+                    if !event_raw.ranges.is_empty()
+                        && written_offsets.insert(event_raw.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&event_raw.ranges);
+                    }
+                    // Write timestamps if not already written
+                    if !event_raw.timestamps.is_empty()
+                        && written_offsets.insert(event_raw.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&event_raw.timestamps);
+                    }
+                }
+
+                current_offset = event_data_offset;
+            } else {
+                // No event data collected - write events with zeroed tracks
+                for event in &self.events {
+                    let mut static_event = event.clone();
+                    // Zero out the event tracks
+                    static_event.ranges = M2Array::default();
+                    static_event.times = M2Array::default();
+
+                    let mut event_data = Vec::new();
+                    static_event.write(&mut event_data, header.version)?;
+                    data_section.extend_from_slice(&event_data);
+                }
+
+                current_offset += events_total_size as u32;
+            }
+        } else {
+            header.events = M2Array::new(0, 0);
+        }
+
+        // ==============================
+        // ATTACHMENTS SECTION
+        // ==============================
+        // Attachments are attach points (weapons, effects) with scale animation
+        if !self.attachments.is_empty() {
+            // Calculate offset from actual data_section length, not tracked current_offset
+            let attach_offset = self.calculate_header_size() + data_section.len();
+            header.attachments = M2Array::new(self.attachments.len() as u32, attach_offset as u32);
+
+            // First, write all attachment structures to a temporary buffer to calculate their total size
+            let mut temp_attach_data = Vec::new();
+            for attach in &self.attachments {
+                let mut attach_data = Vec::new();
+                attach.write(&mut attach_data, header.version)?;
+                temp_attach_data.push(attach_data);
+            }
+            let attachs_total_size: usize = temp_attach_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where attachment animation data will be written (after all attachment structures)
+            let attach_data_start = current_offset + attachs_total_size as u32;
+
+            // Check if we have attachment animation data to preserve
+            if !self.raw_data.attachment_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut attach_data_offset = attach_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.attachment_animation_data {
+                    // Map interpolation_ranges offset (skip if already mapped - shared data)
+                    if !anim.interpolation_ranges.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_ranges_offset)
+                    {
+                        e.insert(attach_data_offset);
+                        attach_data_offset += anim.interpolation_ranges.len() as u32;
+                    }
+
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(attach_data_offset);
+                        attach_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(attach_data_offset);
+                        attach_data_offset += anim.values.len() as u32;
+                    }
+                }
+
+                // Write attachments with relocated offsets
+                for attach in &self.attachments {
+                    let mut relocated_attach = attach.clone();
+                    relocate_attachment_animation_offsets(&mut relocated_attach, &offset_map);
+
+                    let mut attach_data = Vec::new();
+                    relocated_attach.write(&mut attach_data, header.version)?;
+                    data_section.extend_from_slice(&attach_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.attachment_animation_data {
+                    // Write interpolation_ranges only if not already written
+                    if !anim.interpolation_ranges.is_empty()
+                        && written_offsets.insert(anim.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&anim.interpolation_ranges);
+                    }
+
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+                }
+
+                current_offset = attach_data_offset;
+            } else {
+                // No attachment animation data collected - write attachments with zeroed animation tracks
+                for attach in &self.attachments {
+                    let mut static_attach = attach.clone();
+                    // Zero out the scale animation block
+                    static_attach.scale_animation = M2AnimationBlock::default();
+
+                    let mut attach_data = Vec::new();
+                    static_attach.write(&mut attach_data, header.version)?;
+                    data_section.extend_from_slice(&attach_data);
+                }
+
+                current_offset += attachs_total_size as u32;
+            }
+        } else {
+            header.attachments = M2Array::new(0, 0);
+        }
+
+        // ==============================
+        // CAMERAS SECTION
+        // ==============================
+        // Cameras have position, target_position, and roll animation tracks
+        if !self.cameras.is_empty() {
+            // Calculate offset from actual data_section length, not tracked current_offset
+            let camera_offset = self.calculate_header_size() + data_section.len();
+            header.cameras = M2Array::new(self.cameras.len() as u32, camera_offset as u32);
+
+            // First, write all camera structures to a temporary buffer to calculate their total size
+            let mut temp_camera_data = Vec::new();
+            for camera in &self.cameras {
+                let mut camera_data = Vec::new();
+                camera.write(&mut camera_data, header.version)?;
+                temp_camera_data.push(camera_data);
+            }
+            let cameras_total_size: usize = temp_camera_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where camera animation data will be written (after all camera structures)
+            let camera_data_start = current_offset + cameras_total_size as u32;
+
+            // Check if we have camera animation data to preserve
+            if !self.raw_data.camera_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut camera_data_offset = camera_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.camera_animation_data {
+                    // Map interpolation_ranges offset (skip if already mapped - shared data)
+                    if !anim.interpolation_ranges.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_ranges_offset)
+                    {
+                        e.insert(camera_data_offset);
+                        camera_data_offset += anim.interpolation_ranges.len() as u32;
+                    }
+
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(camera_data_offset);
+                        camera_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(camera_data_offset);
+                        camera_data_offset += anim.values.len() as u32;
+                    }
+                }
+
+                // Write cameras with relocated offsets
+                for camera in &self.cameras {
+                    let mut relocated_camera = camera.clone();
+                    relocate_camera_animation_offsets(&mut relocated_camera, &offset_map);
+
+                    let mut camera_data = Vec::new();
+                    relocated_camera.write(&mut camera_data, header.version)?;
+                    data_section.extend_from_slice(&camera_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.camera_animation_data {
+                    // Write interpolation_ranges only if not already written
+                    if !anim.interpolation_ranges.is_empty()
+                        && written_offsets.insert(anim.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&anim.interpolation_ranges);
+                    }
+
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+                }
+
+                current_offset = camera_data_offset;
+            } else {
+                // No camera animation data collected - write cameras with zeroed animation tracks
+                for camera in &self.cameras {
+                    let mut static_camera = camera.clone();
+                    // Zero out all animation blocks
+                    static_camera.position_animation = M2AnimationBlock::default();
+                    static_camera.target_position_animation = M2AnimationBlock::default();
+                    static_camera.roll_animation = M2AnimationBlock::default();
+
+                    let mut camera_data = Vec::new();
+                    static_camera.write(&mut camera_data, header.version)?;
+                    data_section.extend_from_slice(&camera_data);
+                }
+
+                current_offset += cameras_total_size as u32;
+            }
+        } else {
+            header.cameras = M2Array::new(0, 0);
+        }
+
+        // ==============================
+        // LIGHTS SECTION
+        // ==============================
+        // Lights have ambient_color, diffuse_color, attenuation_start, attenuation_end, and visibility animation tracks
+        if !self.lights.is_empty() {
+            // Calculate offset from actual data_section length, not tracked current_offset
+            let light_offset = self.calculate_header_size() + data_section.len();
+            header.lights = M2Array::new(self.lights.len() as u32, light_offset as u32);
+
+            // First, write all light structures to a temporary buffer to calculate their total size
+            let mut temp_light_data = Vec::new();
+            for light in &self.lights {
+                let mut light_data = Vec::new();
+                light.write(&mut light_data, header.version)?;
+                temp_light_data.push(light_data);
+            }
+            let lights_total_size: usize = temp_light_data.iter().map(|v| v.len()).sum();
+
+            // Calculate where light animation data will be written (after all light structures)
+            let light_data_start = current_offset + lights_total_size as u32;
+
+            // Check if we have light animation data to preserve
+            if !self.raw_data.light_animation_data.is_empty() {
+                // Build offset relocation map: old_offset -> new_offset
+                let mut offset_map: HashMap<u32, u32> = HashMap::new();
+                let mut light_data_offset = light_data_start;
+
+                use std::collections::hash_map::Entry;
+
+                for anim in &self.raw_data.light_animation_data {
+                    // Map interpolation_ranges offset (skip if already mapped - shared data)
+                    if !anim.interpolation_ranges.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_ranges_offset)
+                    {
+                        e.insert(light_data_offset);
+                        light_data_offset += anim.interpolation_ranges.len() as u32;
+                    }
+
+                    // Map timestamps offset (skip if already mapped - shared data)
+                    if !anim.timestamps.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_timestamps_offset)
+                    {
+                        e.insert(light_data_offset);
+                        light_data_offset += anim.timestamps.len() as u32;
+                    }
+
+                    // Map values offset (skip if already mapped - shared data)
+                    if !anim.values.is_empty()
+                        && let Entry::Vacant(e) = offset_map.entry(anim.original_values_offset)
+                    {
+                        e.insert(light_data_offset);
+                        light_data_offset += anim.values.len() as u32;
+                    }
+                }
+
+                // Write lights with relocated offsets
+                for light in &self.lights {
+                    let mut relocated_light = light.clone();
+                    relocate_light_animation_offsets(&mut relocated_light, &offset_map);
+
+                    let mut light_data = Vec::new();
+                    relocated_light.write(&mut light_data, header.version)?;
+                    data_section.extend_from_slice(&light_data);
+                }
+
+                // Write animation keyframe data (only write each unique offset once)
+                let mut written_offsets: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+
+                for anim in &self.raw_data.light_animation_data {
+                    // Write interpolation_ranges only if not already written
+                    if !anim.interpolation_ranges.is_empty()
+                        && written_offsets.insert(anim.original_ranges_offset)
+                    {
+                        data_section.extend_from_slice(&anim.interpolation_ranges);
+                    }
+
+                    // Write timestamps only if not already written
+                    if !anim.timestamps.is_empty()
+                        && written_offsets.insert(anim.original_timestamps_offset)
+                    {
+                        data_section.extend_from_slice(&anim.timestamps);
+                    }
+
+                    // Write values only if not already written
+                    if !anim.values.is_empty()
+                        && written_offsets.insert(anim.original_values_offset)
+                    {
+                        data_section.extend_from_slice(&anim.values);
+                    }
+                }
+
+                current_offset = light_data_offset;
+            } else {
+                // No light animation data collected - write lights with zeroed animation tracks
+                for light in &self.lights {
+                    let mut static_light = light.clone();
+                    // Zero out all animation blocks
+                    static_light.ambient_color_animation = M2AnimationBlock::default();
+                    static_light.diffuse_color_animation = M2AnimationBlock::default();
+                    static_light.attenuation_start_animation = M2AnimationBlock::default();
+                    static_light.attenuation_end_animation = M2AnimationBlock::default();
+                    static_light.visibility_animation = M2AnimationBlock::default();
+
+                    let mut light_data = Vec::new();
+                    static_light.write(&mut light_data, header.version)?;
+                    data_section.extend_from_slice(&light_data);
+                }
+
+                current_offset += lights_total_size as u32;
+            }
+        } else {
+            header.lights = M2Array::new(0, 0);
+        }
+
+        // Zero out sections we don't write yet (so header references are valid)
+        // These sections have complex structures with embedded offsets that need proper serialization
+        header.color_replacements = M2Array::new(0, 0);
+        // Note: ribbon_emitters is now handled in the serialization section above
+        // Note: particle_emitters is now handled in the serialization section above
+
+        // Version-specific fields: set up correctly based on target version
+        // TBC and earlier (version <= 263) require texture_flipbooks
+        if header.version <= 263 {
+            header.texture_flipbooks = Some(M2Array::new(0, 0));
+            // Only zero views if we didn't write embedded skin data
+            if self.raw_data.embedded_skins.is_empty() {
+                header.views = M2Array::new(0, 0);
+            }
+        } else {
+            header.texture_flipbooks = None;
+        }
+
+        // Vanilla and TBC (256-263) have playable_animation_lookup
+        // This field was removed in WotLK (264+)
+        if (256..=263).contains(&header.version) {
+            header.playable_animation_lookup = Some(M2Array::new(0, 0));
+        } else {
+            header.playable_animation_lookup = None;
+        }
+
+        // Clear post-BC optional fields we don't serialize
+        header.blend_map_overrides = None;
+        header.texture_combiner_combos = None;
+        header.texture_transforms = None;
+
+        // Suppress unused variable warning
+        let _ = current_offset;
 
         // Finally, write the header followed by the data section
         header.write(writer)?;
@@ -1672,6 +5285,10 @@ impl M2Model {
     }
 
     /// Calculate the size of the header for this model version
+    ///
+    /// This must match exactly what M2Header::write() produces. The write() method
+    /// clears optional fields (blend_map_overrides, texture_combiner_combos, texture_transforms)
+    /// so we don't include them in the size calculation.
     fn calculate_header_size(&self) -> usize {
         let version = self.header.version().unwrap_or(M2Version::Vanilla);
 
@@ -1685,17 +5302,35 @@ impl M2Model {
         size += 2 * 4; // animations
         size += 2 * 4; // animation_lookup
 
+        // Vanilla and TBC (256-263) have playable_animation_lookup
+        // This field was removed in WotLK (264+)
+        let version_num = version.to_header_version();
+        if (256..=263).contains(&version_num) {
+            size += 2 * 4; // playable_animation_lookup
+        }
+
         size += 2 * 4; // bones
         size += 2 * 4; // key_bone_lookup
 
         size += 2 * 4; // vertices
-        size += 2 * 4; // views
+
+        // Views field changes between versions
+        if version <= M2Version::TBC {
+            size += 2 * 4; // views as M2Array (8 bytes)
+        } else {
+            size += 4; // num_skin_profiles as u32 (4 bytes)
+        }
 
         size += 2 * 4; // color_animations
 
         size += 2 * 4; // textures
         size += 2 * 4; // transparency_lookup
-        size += 2 * 4; // transparency_animations
+
+        // Texture flipbooks only exist in BC and earlier
+        if version <= M2Version::TBC {
+            size += 2 * 4; // texture_flipbooks
+        }
+
         size += 2 * 4; // texture_animations
 
         size += 2 * 4; // color_replacements
@@ -1728,14 +5363,8 @@ impl M2Model {
         size += 2 * 4; // ribbon_emitters
         size += 2 * 4; // particle_emitters
 
-        // Version-specific fields
-        if version >= M2Version::Cataclysm {
-            size += 2 * 4; // texture_combiner_combos
-        }
-
-        if version >= M2Version::Legion {
-            size += 2 * 4; // texture_transforms
-        }
+        // Note: Optional fields (blend_map_overrides, texture_combiner_combos, texture_transforms)
+        // are NOT included because write() always clears them to None before writing the header.
 
         size
     }
@@ -1880,18 +5509,18 @@ impl M2Model {
         resolver: &dyn FileResolver,
     ) -> Result<String> {
         // Legion+ models use TXID chunk
-        if let Some(texture_ids) = &self.texture_file_ids {
-            if let Some(id) = texture_ids.get(index) {
-                return resolver.resolve_file_data_id(id);
-            }
+        if let Some(texture_ids) = &self.texture_file_ids
+            && let Some(id) = texture_ids.get(index)
+        {
+            return resolver.resolve_file_data_id(id);
         }
 
         // Pre-Legion models use embedded texture names
-        if let Some(texture) = self.textures.get(index) {
-            if !texture.filename.string.data.is_empty() {
-                let filename = String::from_utf8_lossy(&texture.filename.string.data).to_string();
-                return Ok(filename.trim_end_matches('\0').to_string());
-            }
+        if let Some(texture) = self.textures.get(index)
+            && !texture.filename.string.data.is_empty()
+        {
+            let filename = String::from_utf8_lossy(&texture.filename.string.data).to_string();
+            return Ok(filename.trim_end_matches('\0').to_string());
         }
 
         Err(M2Error::ExternalFileError(format!(
@@ -1904,23 +5533,23 @@ impl M2Model {
     /// Falls back to embedded texture names for pre-Legion models
     pub fn load_texture_file(&self, index: usize, resolver: &dyn FileResolver) -> Result<Vec<u8>> {
         // Legion+ models use TXID chunk
-        if let Some(texture_ids) = &self.texture_file_ids {
-            if let Some(id) = texture_ids.get(index) {
-                return resolver.load_texture_by_id(id);
-            }
+        if let Some(texture_ids) = &self.texture_file_ids
+            && let Some(id) = texture_ids.get(index)
+        {
+            return resolver.load_texture_by_id(id);
         }
 
         // Pre-Legion models use embedded texture names - we can't load them directly
         // since we don't have FileDataIDs, just return an error with the filename
-        if let Some(texture) = self.textures.get(index) {
-            if !texture.filename.string.data.is_empty() {
-                let filename = String::from_utf8_lossy(&texture.filename.string.data).to_string();
-                let clean_filename = filename.trim_end_matches('\0').to_string();
-                return Err(M2Error::ExternalFileError(format!(
-                    "Cannot load pre-Legion texture '{}' without FileDataID",
-                    clean_filename
-                )));
-            }
+        if let Some(texture) = self.textures.get(index)
+            && !texture.filename.string.data.is_empty()
+        {
+            let filename = String::from_utf8_lossy(&texture.filename.string.data).to_string();
+            let clean_filename = filename.trim_end_matches('\0').to_string();
+            return Err(M2Error::ExternalFileError(format!(
+                "Cannot load pre-Legion texture '{}' without FileDataID",
+                clean_filename
+            )));
         }
 
         Err(M2Error::ExternalFileError(format!(
@@ -2291,6 +5920,15 @@ mod tests {
             vertices: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
+            particle_emitters: Vec::new(),
+            ribbon_emitters: Vec::new(),
+            texture_animations: Vec::new(),
+            color_animations: Vec::new(),
+            transparency_animations: Vec::new(),
+            events: Vec::new(),
+            attachments: Vec::new(),
+            cameras: Vec::new(),
+            lights: Vec::new(),
             raw_data: M2RawData::default(),
             skin_file_ids: None,
             animation_file_ids: None,
@@ -2352,6 +5990,15 @@ mod tests {
             vertices: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
+            particle_emitters: Vec::new(),
+            ribbon_emitters: Vec::new(),
+            texture_animations: Vec::new(),
+            color_animations: Vec::new(),
+            transparency_animations: Vec::new(),
+            events: Vec::new(),
+            attachments: Vec::new(),
+            cameras: Vec::new(),
+            lights: Vec::new(),
             raw_data: M2RawData::default(),
             skin_file_ids: Some(SkinFileIds {
                 ids: vec![123456, 789012],
@@ -2514,6 +6161,15 @@ mod tests {
             vertices: Vec::new(),
             textures: vec![texture],
             materials: Vec::new(),
+            particle_emitters: Vec::new(),
+            ribbon_emitters: Vec::new(),
+            texture_animations: Vec::new(),
+            color_animations: Vec::new(),
+            transparency_animations: Vec::new(),
+            events: Vec::new(),
+            attachments: Vec::new(),
+            cameras: Vec::new(),
+            lights: Vec::new(),
             raw_data: M2RawData::default(),
             skin_file_ids: None,
             animation_file_ids: None,
@@ -2578,6 +6234,15 @@ mod tests {
             vertices: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
+            particle_emitters: Vec::new(),
+            ribbon_emitters: Vec::new(),
+            texture_animations: Vec::new(),
+            color_animations: Vec::new(),
+            transparency_animations: Vec::new(),
+            events: Vec::new(),
+            attachments: Vec::new(),
+            cameras: Vec::new(),
+            lights: Vec::new(),
             raw_data: M2RawData::default(),
             skin_file_ids: None,
             animation_file_ids: None,
@@ -2706,5 +6371,495 @@ mod tests {
         assert!(!model.has_external_files());
         assert!(!model.is_animation_blacklisted(1));
         assert!(model.get_extended_particle_data().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_m2_write_read_roundtrip() {
+        use crate::chunks::vertex::M2Vertex;
+        use crate::common::{C2Vector, C3Vector};
+        use crate::version::M2Version;
+
+        // Create a minimal but complete M2 model
+        let mut model = M2Model::default();
+        model.header = M2Header::new(M2Version::WotLK);
+        model.name = Some("TestModel".to_string());
+
+        // Add some test vertices
+        for i in 0..4 {
+            let vertex = M2Vertex {
+                position: C3Vector {
+                    x: i as f32,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                bone_weights: [255, 0, 0, 0],
+                bone_indices: [0, 0, 0, 0],
+                normal: C3Vector {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                tex_coords: C2Vector { x: 0.0, y: 0.0 },
+                tex_coords2: None,
+            };
+            model.vertices.push(vertex);
+        }
+
+        // Write to bytes
+        let mut buffer = Cursor::new(Vec::new());
+        let write_result = model.write(&mut buffer);
+        assert!(write_result.is_ok(), "Write should succeed");
+
+        // Read back
+        buffer.set_position(0);
+        let read_result = M2Model::parse(&mut buffer);
+        assert!(read_result.is_ok(), "Read should succeed");
+
+        let read_model = read_result.unwrap();
+
+        // Verify key fields match
+        assert_eq!(read_model.name, model.name, "Name should match");
+        assert_eq!(
+            read_model.vertices.len(),
+            model.vertices.len(),
+            "Vertex count should match"
+        );
+        assert_eq!(
+            read_model.header.version, model.header.version,
+            "Version should match"
+        );
+
+        // Verify vertex data
+        for (i, (orig, read)) in model
+            .vertices
+            .iter()
+            .zip(read_model.vertices.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                orig.position.x, read.position.x,
+                "Vertex {} X position should match",
+                i
+            );
+            assert_eq!(
+                orig.position.y, read.position.y,
+                "Vertex {} Y position should match",
+                i
+            );
+            assert_eq!(
+                orig.position.z, read.position.z,
+                "Vertex {} Z position should match",
+                i
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_m2_version_conversion_roundtrip() {
+        use crate::chunks::vertex::M2Vertex;
+        use crate::common::{C2Vector, C3Vector};
+        use crate::version::M2Version;
+
+        // Create a WotLK model
+        let mut model = M2Model::default();
+        model.header = M2Header::new(M2Version::WotLK);
+        model.name = Some("ConversionTest".to_string());
+
+        // Add a test vertex
+        let vertex = M2Vertex {
+            position: C3Vector {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            bone_weights: [255, 0, 0, 0],
+            bone_indices: [0, 0, 0, 0],
+            normal: C3Vector {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            tex_coords: C2Vector { x: 0.5, y: 0.5 },
+            tex_coords2: None,
+        };
+        model.vertices.push(vertex);
+
+        // Convert to TBC
+        let convert_result = model.convert(M2Version::TBC);
+        assert!(convert_result.is_ok(), "Conversion to TBC should succeed");
+        let tbc_model = convert_result.unwrap();
+
+        // Verify conversion changed version
+        assert_eq!(
+            tbc_model.header.version,
+            M2Version::TBC.to_header_version(),
+            "Version should be TBC"
+        );
+
+        // Write TBC model to bytes
+        let mut buffer = Cursor::new(Vec::new());
+        let write_result = tbc_model.write(&mut buffer);
+        assert!(
+            write_result.is_ok(),
+            "Write of converted model should succeed"
+        );
+
+        // Read back and verify
+        buffer.set_position(0);
+        let read_result = M2Model::parse(&mut buffer);
+        assert!(
+            read_result.is_ok(),
+            "Read of converted model should succeed: {:?}",
+            read_result.err()
+        );
+
+        let read_model = read_result.unwrap();
+        assert_eq!(
+            read_model.header.version,
+            M2Version::TBC.to_header_version(),
+            "Re-read version should be TBC"
+        );
+        assert_eq!(read_model.vertices.len(), 1, "Should have 1 vertex");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_m2_cataclysm_roundtrip() {
+        use crate::chunks::vertex::M2Vertex;
+        use crate::common::{C2Vector, C3Vector};
+        use crate::version::M2Version;
+
+        // Create a Cataclysm model (includes secondary tex coords)
+        let mut model = M2Model::default();
+        model.header = M2Header::new(M2Version::Cataclysm);
+        model.name = Some("CataModel".to_string());
+
+        // Add a test vertex with secondary texture coordinates
+        let vertex = M2Vertex {
+            position: C3Vector {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            bone_weights: [255, 0, 0, 0],
+            bone_indices: [0, 0, 0, 0],
+            normal: C3Vector {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            tex_coords: C2Vector { x: 0.5, y: 0.5 },
+            tex_coords2: Some(C2Vector { x: 0.25, y: 0.75 }),
+        };
+        model.vertices.push(vertex);
+
+        // Write to bytes
+        let mut buffer = Cursor::new(Vec::new());
+        let write_result = model.write(&mut buffer);
+        assert!(
+            write_result.is_ok(),
+            "Write of Cataclysm model should succeed: {:?}",
+            write_result.err()
+        );
+
+        // Read back and verify
+        buffer.set_position(0);
+        let read_result = M2Model::parse(&mut buffer);
+        assert!(
+            read_result.is_ok(),
+            "Read of Cataclysm model should succeed: {:?}",
+            read_result.err()
+        );
+
+        let read_model = read_result.unwrap();
+        assert_eq!(
+            read_model.header.version,
+            M2Version::Cataclysm.to_header_version(),
+            "Re-read version should be Cataclysm (272)"
+        );
+        assert_eq!(read_model.vertices.len(), 1, "Should have 1 vertex");
+
+        // Cataclysm vertices have secondary tex coords
+        assert!(
+            read_model.vertices[0].tex_coords2.is_some(),
+            "Cataclysm should have secondary tex coords"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_m2_mop_roundtrip() {
+        use crate::chunks::vertex::M2Vertex;
+        use crate::common::{C2Vector, C3Vector};
+        use crate::version::M2Version;
+
+        // Create a MoP model
+        let mut model = M2Model::default();
+        model.header = M2Header::new(M2Version::MoP);
+        model.name = Some("MoPModel".to_string());
+
+        // Add test vertices
+        for i in 0..3 {
+            let vertex = M2Vertex {
+                position: C3Vector {
+                    x: i as f32,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                bone_weights: [255, 0, 0, 0],
+                bone_indices: [0, 0, 0, 0],
+                normal: C3Vector {
+                    x: 0.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+                tex_coords: C2Vector { x: 0.0, y: 0.0 },
+                tex_coords2: Some(C2Vector { x: 1.0, y: 1.0 }),
+            };
+            model.vertices.push(vertex);
+        }
+
+        // Write to bytes
+        let mut buffer = Cursor::new(Vec::new());
+        let write_result = model.write(&mut buffer);
+        assert!(
+            write_result.is_ok(),
+            "Write of MoP model should succeed: {:?}",
+            write_result.err()
+        );
+
+        // Read back and verify
+        buffer.set_position(0);
+        let read_result = M2Model::parse(&mut buffer);
+        assert!(
+            read_result.is_ok(),
+            "Read of MoP model should succeed: {:?}",
+            read_result.err()
+        );
+
+        let read_model = read_result.unwrap();
+        assert_eq!(
+            read_model.header.version,
+            M2Version::MoP.to_header_version(),
+            "Re-read version should be MoP (272)"
+        );
+        assert_eq!(read_model.vertices.len(), 3, "Should have 3 vertices");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_m2_wotlk_to_cataclysm_conversion() {
+        use crate::chunks::vertex::M2Vertex;
+        use crate::common::{C2Vector, C3Vector};
+        use crate::version::M2Version;
+
+        // Create a WotLK model
+        let mut model = M2Model::default();
+        model.header = M2Header::new(M2Version::WotLK);
+        model.name = Some("WotLKToCata".to_string());
+
+        let vertex = M2Vertex {
+            position: C3Vector {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            bone_weights: [255, 0, 0, 0],
+            bone_indices: [0, 0, 0, 0],
+            normal: C3Vector {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            tex_coords: C2Vector { x: 0.5, y: 0.5 },
+            tex_coords2: None,
+        };
+        model.vertices.push(vertex);
+
+        // Convert to Cataclysm
+        let converted = model
+            .convert(M2Version::Cataclysm)
+            .expect("WotLK -> Cataclysm conversion failed");
+
+        assert_eq!(
+            converted.header.version,
+            M2Version::Cataclysm.to_header_version(),
+            "Version should be Cataclysm (272)"
+        );
+
+        // Write and re-read
+        let mut buffer = Cursor::new(Vec::new());
+        converted.write(&mut buffer).expect("Write failed");
+
+        buffer.set_position(0);
+        let read_model = M2Model::parse(&mut buffer).expect("Read failed");
+
+        assert_eq!(
+            read_model.header.version,
+            M2Version::Cataclysm.to_header_version()
+        );
+        assert_eq!(read_model.vertices.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_m2_wotlk_to_mop_conversion() {
+        use crate::chunks::vertex::M2Vertex;
+        use crate::common::{C2Vector, C3Vector};
+        use crate::version::M2Version;
+
+        let mut model = M2Model::default();
+        model.header = M2Header::new(M2Version::WotLK);
+        model.name = Some("WotLKToMoP".to_string());
+
+        let vertex = M2Vertex {
+            position: C3Vector {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            bone_weights: [255, 0, 0, 0],
+            bone_indices: [0, 0, 0, 0],
+            normal: C3Vector {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            tex_coords: C2Vector { x: 0.5, y: 0.5 },
+            tex_coords2: None,
+        };
+        model.vertices.push(vertex);
+
+        // Convert to MoP
+        let converted = model
+            .convert(M2Version::MoP)
+            .expect("WotLK -> MoP conversion failed");
+
+        assert_eq!(converted.header.version, M2Version::MoP.to_header_version());
+
+        // Write and re-read
+        let mut buffer = Cursor::new(Vec::new());
+        converted.write(&mut buffer).expect("Write failed");
+
+        buffer.set_position(0);
+        let read_model = M2Model::parse(&mut buffer).expect("Read failed");
+
+        assert_eq!(
+            read_model.header.version,
+            M2Version::MoP.to_header_version()
+        );
+        assert_eq!(read_model.vertices.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_m2_wotlk_to_vanilla_conversion() {
+        use crate::chunks::vertex::M2Vertex;
+        use crate::common::{C2Vector, C3Vector};
+        use crate::version::M2Version;
+
+        let mut model = M2Model::default();
+        model.header = M2Header::new(M2Version::WotLK);
+        model.name = Some("WotLKToVanilla".to_string());
+
+        let vertex = M2Vertex {
+            position: C3Vector {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            bone_weights: [255, 0, 0, 0],
+            bone_indices: [0, 0, 0, 0],
+            normal: C3Vector {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            tex_coords: C2Vector { x: 0.5, y: 0.5 },
+            tex_coords2: None,
+        };
+        model.vertices.push(vertex);
+
+        // Convert to Vanilla
+        let converted = model
+            .convert(M2Version::Vanilla)
+            .expect("WotLK -> Vanilla conversion failed");
+
+        assert_eq!(
+            converted.header.version,
+            M2Version::Vanilla.to_header_version()
+        );
+
+        // Write and re-read
+        let mut buffer = Cursor::new(Vec::new());
+        converted.write(&mut buffer).expect("Write failed");
+
+        buffer.set_position(0);
+        let read_model = M2Model::parse(&mut buffer).expect("Read failed");
+
+        assert_eq!(
+            read_model.header.version,
+            M2Version::Vanilla.to_header_version()
+        );
+        assert_eq!(read_model.vertices.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_m2_cataclysm_to_wotlk_conversion() {
+        use crate::chunks::vertex::M2Vertex;
+        use crate::common::{C2Vector, C3Vector};
+        use crate::version::M2Version;
+
+        let mut model = M2Model::default();
+        model.header = M2Header::new(M2Version::Cataclysm);
+        model.name = Some("CataToWotLK".to_string());
+
+        let vertex = M2Vertex {
+            position: C3Vector {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            bone_weights: [255, 0, 0, 0],
+            bone_indices: [0, 0, 0, 0],
+            normal: C3Vector {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            tex_coords: C2Vector { x: 0.5, y: 0.5 },
+            tex_coords2: Some(C2Vector { x: 0.25, y: 0.75 }),
+        };
+        model.vertices.push(vertex);
+
+        // Convert to WotLK
+        let converted = model
+            .convert(M2Version::WotLK)
+            .expect("Cataclysm -> WotLK conversion failed");
+
+        assert_eq!(
+            converted.header.version,
+            M2Version::WotLK.to_header_version()
+        );
+
+        // Write and re-read
+        let mut buffer = Cursor::new(Vec::new());
+        converted.write(&mut buffer).expect("Write failed");
+
+        buffer.set_position(0);
+        let read_model = M2Model::parse(&mut buffer).expect("Read failed");
+
+        assert_eq!(
+            read_model.header.version,
+            M2Version::WotLK.to_header_version()
+        );
+        assert_eq!(read_model.vertices.len(), 1);
+
+        // Note: tex_coords2 is present in ALL versions (48-byte vertex format)
+        // The secondary texture coords are preserved during conversion
+        assert!(read_model.vertices[0].tex_coords2.is_some());
     }
 }

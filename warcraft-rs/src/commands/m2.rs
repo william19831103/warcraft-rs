@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use wow_blp::parser::load_blp;
 use wow_m2::{
-    AnimFile, M2Converter, M2Model, M2Version, Skin,
-    skin::{OldSkinHeader, SkinG, SkinHeader, SkinHeaderT},
+    AnimFile, M2Converter, M2Model, M2Version, SkinFile,
+    skin::{OldSkinHeader, SkinG, SkinHeaderT},
 };
 
 use crate::utils::{NodeType, TreeNode, TreeOptions, render_tree};
@@ -153,11 +153,8 @@ pub fn execute(cmd: M2Commands) -> Result<()> {
             detailed,
             old_format,
         } => {
-            if old_format {
-                handle_skin_info::<OldSkinHeader>(file, detailed)
-            } else {
-                handle_skin_info::<SkinHeader>(file, detailed)
-            }
+            // Use auto-detection by default, with old_format as an override
+            handle_skin_info_auto(file, detailed, old_format)
         }
         M2Commands::SkinConvert {
             input,
@@ -670,18 +667,284 @@ fn handle_tree(path: PathBuf, max_depth: usize, show_size: bool, show_refs: bool
 
     root = root.add_child(material_node);
 
+    // Add animation data section showing preserved animation tracks
+    let mut anim_data_node = TreeNode::new(
+        "Animation Track Data (Preserved)".to_string(),
+        NodeType::Data,
+    );
+
+    // Bone animation data summary
+    let bone_anim_count = model.raw_data.bone_animation_data.len();
+    if bone_anim_count > 0 {
+        // Count tracks by type
+        let mut translation_count = 0;
+        let mut rotation_count = 0;
+        let mut scale_count = 0;
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.bone_animation_data {
+            match anim.track_type {
+                wow_m2::model::TrackType::Translation => translation_count += 1,
+                wow_m2::model::TrackType::Rotation => rotation_count += 1,
+                wow_m2::model::TrackType::Scale => scale_count += 1,
+            }
+            // Each timestamp is 4 bytes
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let bone_node = TreeNode::new("Bone Animations".to_string(), NodeType::Data)
+            .with_metadata("total_tracks", &bone_anim_count.to_string())
+            .with_metadata("translation_tracks", &translation_count.to_string())
+            .with_metadata("rotation_tracks", &rotation_count.to_string())
+            .with_metadata("scale_tracks", &scale_count.to_string())
+            .with_metadata("total_keyframes", &total_keyframes.to_string());
+        anim_data_node = anim_data_node.add_child(bone_node);
+    }
+
+    // Particle emitter animation data summary
+    let particle_anim_count = model.raw_data.particle_animation_data.len();
+    if particle_anim_count > 0 {
+        // Count tracks by type
+        let mut track_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.particle_animation_data {
+            let track_name = match anim.track_type {
+                wow_m2::model::ParticleTrackType::EmissionSpeed => "emission_speed",
+                wow_m2::model::ParticleTrackType::EmissionRate => "emission_rate",
+                wow_m2::model::ParticleTrackType::EmissionArea => "emission_area",
+                wow_m2::model::ParticleTrackType::XYScale => "xy_scale",
+                wow_m2::model::ParticleTrackType::ZScale => "z_scale",
+                wow_m2::model::ParticleTrackType::Color => "color",
+                wow_m2::model::ParticleTrackType::Transparency => "transparency",
+                wow_m2::model::ParticleTrackType::Size => "size",
+                wow_m2::model::ParticleTrackType::Intensity => "intensity",
+                wow_m2::model::ParticleTrackType::ZSource => "z_source",
+            };
+            *track_counts.entry(track_name).or_insert(0) += 1;
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let emitter_count = model.particle_emitters.len();
+        let particle_node =
+            TreeNode::new("Particle Emitter Animations".to_string(), NodeType::Data)
+                .with_metadata("emitters", &emitter_count.to_string())
+                .with_metadata("total_tracks", &particle_anim_count.to_string())
+                .with_metadata("total_keyframes", &total_keyframes.to_string())
+                .with_metadata(
+                    "track_types",
+                    &format!("{} unique types", track_counts.len()),
+                );
+        anim_data_node = anim_data_node.add_child(particle_node);
+    }
+
+    // Ribbon emitter animation data summary
+    let ribbon_anim_count = model.raw_data.ribbon_animation_data.len();
+    if ribbon_anim_count > 0 {
+        let mut color_count = 0;
+        let mut alpha_count = 0;
+        let mut height_above_count = 0;
+        let mut height_below_count = 0;
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.ribbon_animation_data {
+            match anim.track_type {
+                wow_m2::model::RibbonTrackType::Color => color_count += 1,
+                wow_m2::model::RibbonTrackType::Alpha => alpha_count += 1,
+                wow_m2::model::RibbonTrackType::HeightAbove => height_above_count += 1,
+                wow_m2::model::RibbonTrackType::HeightBelow => height_below_count += 1,
+            }
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let emitter_count = model.ribbon_emitters.len();
+        let ribbon_node = TreeNode::new("Ribbon Emitter Animations".to_string(), NodeType::Data)
+            .with_metadata("emitters", &emitter_count.to_string())
+            .with_metadata("total_tracks", &ribbon_anim_count.to_string())
+            .with_metadata("color_tracks", &color_count.to_string())
+            .with_metadata("alpha_tracks", &alpha_count.to_string())
+            .with_metadata("height_above_tracks", &height_above_count.to_string())
+            .with_metadata("height_below_tracks", &height_below_count.to_string())
+            .with_metadata("total_keyframes", &total_keyframes.to_string());
+        anim_data_node = anim_data_node.add_child(ribbon_node);
+    }
+
+    // Texture animation data summary
+    let texture_anim_count = model.raw_data.texture_animation_data.len();
+    if texture_anim_count > 0 {
+        let mut translation_u_count = 0;
+        let mut translation_v_count = 0;
+        let mut rotation_count = 0;
+        let mut scale_u_count = 0;
+        let mut scale_v_count = 0;
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.texture_animation_data {
+            match anim.track_type {
+                wow_m2::model::TextureTrackType::TranslationU => translation_u_count += 1,
+                wow_m2::model::TextureTrackType::TranslationV => translation_v_count += 1,
+                wow_m2::model::TextureTrackType::Rotation => rotation_count += 1,
+                wow_m2::model::TextureTrackType::ScaleU => scale_u_count += 1,
+                wow_m2::model::TextureTrackType::ScaleV => scale_v_count += 1,
+            }
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let anim_count = model.texture_animations.len();
+        let texture_node = TreeNode::new("Texture Animations".to_string(), NodeType::Data)
+            .with_metadata("animations", &anim_count.to_string())
+            .with_metadata("total_tracks", &texture_anim_count.to_string())
+            .with_metadata("translation_u_tracks", &translation_u_count.to_string())
+            .with_metadata("translation_v_tracks", &translation_v_count.to_string())
+            .with_metadata("rotation_tracks", &rotation_count.to_string())
+            .with_metadata("scale_u_tracks", &scale_u_count.to_string())
+            .with_metadata("scale_v_tracks", &scale_v_count.to_string())
+            .with_metadata("total_keyframes", &total_keyframes.to_string());
+        anim_data_node = anim_data_node.add_child(texture_node);
+    }
+
+    // Color animation data summary
+    let color_anim_count = model.raw_data.color_animation_data.len();
+    if color_anim_count > 0 {
+        let mut color_count = 0;
+        let mut alpha_count = 0;
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.color_animation_data {
+            match anim.track_type {
+                wow_m2::model::ColorTrackType::Color => color_count += 1,
+                wow_m2::model::ColorTrackType::Alpha => alpha_count += 1,
+            }
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let anim_count = model.color_animations.len();
+        let color_node = TreeNode::new("Color Animations".to_string(), NodeType::Data)
+            .with_metadata("animations", &anim_count.to_string())
+            .with_metadata("total_tracks", &color_anim_count.to_string())
+            .with_metadata("color_tracks", &color_count.to_string())
+            .with_metadata("alpha_tracks", &alpha_count.to_string())
+            .with_metadata("total_keyframes", &total_keyframes.to_string());
+        anim_data_node = anim_data_node.add_child(color_node);
+    }
+
+    // Transparency animation data summary
+    let transparency_anim_count = model.raw_data.transparency_animation_data.len();
+    if transparency_anim_count > 0 {
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.transparency_animation_data {
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let anim_count = model.transparency_animations.len();
+        let transparency_node =
+            TreeNode::new("Transparency Animations".to_string(), NodeType::Data)
+                .with_metadata("animations", &anim_count.to_string())
+                .with_metadata("total_tracks", &transparency_anim_count.to_string())
+                .with_metadata("total_keyframes", &total_keyframes.to_string());
+        anim_data_node = anim_data_node.add_child(transparency_node);
+    }
+
+    // Event track data summary
+    let event_data_count = model.raw_data.event_data.len();
+    if event_data_count > 0 {
+        let mut total_timestamps = 0;
+
+        for event in &model.raw_data.event_data {
+            total_timestamps += event.timestamps.len() / 4; // 4 bytes per u32 timestamp
+        }
+
+        let event_count = model.events.len();
+        let event_node = TreeNode::new("Events".to_string(), NodeType::Data)
+            .with_metadata("events", &event_count.to_string())
+            .with_metadata("tracks_with_data", &event_data_count.to_string())
+            .with_metadata("total_timestamps", &total_timestamps.to_string());
+        anim_data_node = anim_data_node.add_child(event_node);
+    }
+
+    // Attachment animation data summary
+    let attachment_anim_count = model.raw_data.attachment_animation_data.len();
+    if attachment_anim_count > 0 {
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.attachment_animation_data {
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let attachment_count = model.attachments.len();
+        let attachment_node = TreeNode::new("Attachments".to_string(), NodeType::Data)
+            .with_metadata("attachments", &attachment_count.to_string())
+            .with_metadata("total_tracks", &attachment_anim_count.to_string())
+            .with_metadata("total_keyframes", &total_keyframes.to_string());
+        anim_data_node = anim_data_node.add_child(attachment_node);
+    }
+
+    // Camera animation data summary
+    let camera_anim_count = model.raw_data.camera_animation_data.len();
+    if camera_anim_count > 0 {
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.camera_animation_data {
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let camera_count = model.cameras.len();
+        let camera_node = TreeNode::new("Cameras".to_string(), NodeType::Data)
+            .with_metadata("cameras", &camera_count.to_string())
+            .with_metadata("total_tracks", &camera_anim_count.to_string())
+            .with_metadata("total_keyframes", &total_keyframes.to_string());
+        anim_data_node = anim_data_node.add_child(camera_node);
+    }
+
+    // Light animation data summary
+    let light_anim_count = model.raw_data.light_animation_data.len();
+    if light_anim_count > 0 {
+        let mut total_keyframes = 0;
+
+        for anim in &model.raw_data.light_animation_data {
+            total_keyframes += anim.timestamps.len() / 4;
+        }
+
+        let light_count = model.lights.len();
+        let light_node = TreeNode::new("Lights".to_string(), NodeType::Data)
+            .with_metadata("lights", &light_count.to_string())
+            .with_metadata("total_tracks", &light_anim_count.to_string())
+            .with_metadata("total_keyframes", &total_keyframes.to_string());
+        anim_data_node = anim_data_node.add_child(light_node);
+    }
+
+    // Only add the animation data section if we have any animation data
+    let has_anim_data = bone_anim_count > 0
+        || particle_anim_count > 0
+        || ribbon_anim_count > 0
+        || texture_anim_count > 0
+        || color_anim_count > 0
+        || transparency_anim_count > 0
+        || event_data_count > 0
+        || attachment_anim_count > 0
+        || camera_anim_count > 0
+        || light_anim_count > 0;
+
+    if has_anim_data {
+        anim_data_node =
+            anim_data_node.with_metadata("status", "✅ Animation data preserved for roundtrip");
+        root = root.add_child(anim_data_node);
+    }
+
     // Add version-specific features
     if let Some(version) = model.header.version() {
-        if version >= M2Version::Cataclysm {
-            if let Some(ref combos) = model.header.texture_combiner_combos {
-                let combo_node = TreeNode::new(
-                    "Texture Combiner Combos (Cataclysm+)".to_string(),
-                    NodeType::Data,
-                )
-                .with_metadata("count", &combos.count.to_string())
-                .with_metadata("offset", &format!("0x{:x}", combos.offset));
-                root = root.add_child(combo_node);
-            }
+        if version >= M2Version::Cataclysm
+            && let Some(ref combos) = model.header.texture_combiner_combos
+        {
+            let combo_node = TreeNode::new(
+                "Texture Combiner Combos (Cataclysm+)".to_string(),
+                NodeType::Data,
+            )
+            .with_metadata("count", &combos.count.to_string())
+            .with_metadata("offset", &format!("0x{:x}", combos.offset));
+            root = root.add_child(combo_node);
         }
 
         if version >= M2Version::WotLK {
@@ -714,6 +977,160 @@ fn handle_tree(path: PathBuf, max_depth: usize, show_size: bool, show_refs: bool
     Ok(())
 }
 
+fn handle_skin_info_auto(path: PathBuf, detailed: bool, force_old_format: bool) -> Result<()> {
+    println!("Loading Skin file: {}", path.display());
+
+    // Get file size for reference
+    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    // If force_old_format is specified, use the old parser directly
+    if force_old_format {
+        let skin = SkinG::<OldSkinHeader>::load(&path)
+            .with_context(|| format!("Failed to load Skin file from {}", path.display()))?;
+
+        println!("\n=== Skin Information ===");
+        println!("Format: Old (forced via --old-format)");
+        println!("File size: {} bytes", file_size);
+        println!("Indices: {}", skin.indices.len());
+        println!("Triangles: {}", skin.triangles.len());
+        println!("Bone Indices: {}", skin.bone_indices.len());
+        println!("Submeshes: {}", skin.submeshes.len());
+        println!("Batches: {}", skin.batches.len());
+
+        if detailed {
+            print_skin_details(&skin.submeshes, &skin.batches);
+            print_skin_samples(&skin.indices, &skin.triangles, &skin.bone_indices);
+        }
+
+        return Ok(());
+    }
+
+    // Use auto-detection
+    let skin = SkinFile::load(&path)
+        .with_context(|| format!("Failed to load Skin file from {}", path.display()))?;
+
+    println!("\n=== Skin Information ===");
+
+    let format_name = if skin.is_new_format() {
+        "New (Cataclysm+)"
+    } else {
+        "Old (WotLK and earlier)"
+    };
+    println!("Format: {}", format_name);
+    println!("File size: {} bytes", file_size);
+
+    println!("Indices: {}", skin.indices().len());
+    println!("Triangles: {}", skin.triangles().len());
+    println!("Bone Indices: {}", skin.bone_indices().len());
+    println!("Submeshes: {}", skin.submeshes().len());
+    println!("Batches: {}", skin.batches().len());
+
+    if detailed {
+        print_skin_details(skin.submeshes(), skin.batches());
+        print_skin_samples(skin.indices(), skin.triangles(), skin.bone_indices());
+    }
+
+    Ok(())
+}
+
+fn print_skin_details(
+    submeshes: &[wow_m2::skin::SkinSubmesh],
+    batches: &[wow_m2::skin::SkinBatch],
+) {
+    if !submeshes.is_empty() {
+        println!("\n=== Submeshes ===");
+        for (i, submesh) in submeshes.iter().enumerate() {
+            println!(
+                "  [{}] ID: {}, Vertices: {} (start: {}), Triangles: {} (start: {})",
+                i,
+                submesh.id,
+                submesh.vertex_count,
+                submesh.vertex_start,
+                submesh.triangle_count,
+                submesh.triangle_start
+            );
+            println!(
+                "       Bones: {} (start: {}), Center: [{:.2}, {:.2}, {:.2}]",
+                submesh.bone_count,
+                submesh.bone_start,
+                submesh.center[0],
+                submesh.center[1],
+                submesh.center[2]
+            );
+        }
+    }
+
+    if !batches.is_empty() {
+        println!("\n=== Batches ===");
+        for (i, batch) in batches.iter().enumerate() {
+            println!(
+                "  [{}] Submesh: {}, Shader: {}, Textures: {}, Material: {}",
+                i,
+                batch.skin_section_index,
+                batch.shader_id,
+                batch.texture_count,
+                batch.material_index
+            );
+        }
+    }
+}
+
+fn print_skin_samples(indices: &[u16], triangles: &[u16], bone_indices: &[u8]) {
+    println!("\n=== Data Samples ===");
+
+    // Show first few indices
+    if !indices.is_empty() {
+        let sample: Vec<_> = indices.iter().take(10).collect();
+        println!("Indices (first 10): {:?}", sample);
+        if indices.len() > 10 {
+            println!("  ... and {} more", indices.len() - 10);
+        }
+    }
+
+    // Show first few triangles (as groups of 3)
+    if !triangles.is_empty() {
+        println!("Triangles (first 3 faces):");
+        for i in 0..3.min(triangles.len() / 3) {
+            let base = i * 3;
+            println!(
+                "  Face {}: [{}, {}, {}]",
+                i,
+                triangles[base],
+                triangles[base + 1],
+                triangles[base + 2]
+            );
+        }
+        if triangles.len() > 9 {
+            println!("  ... and {} more faces", triangles.len() / 3 - 3);
+        }
+    }
+
+    // Show first few bone indices (as groups of 4 if possible)
+    if !bone_indices.is_empty() {
+        println!("Bone indices (first 5 vertices):");
+        for i in 0..5.min(bone_indices.len() / 4) {
+            let base = i * 4;
+            if base + 3 < bone_indices.len() {
+                println!(
+                    "  Vertex {}: [{}, {}, {}, {}]",
+                    i,
+                    bone_indices[base],
+                    bone_indices[base + 1],
+                    bone_indices[base + 2],
+                    bone_indices[base + 3]
+                );
+            }
+        }
+        println!(
+            "  Total: {} bytes ({} if 4 bytes/vertex = {} vertices)",
+            bone_indices.len(),
+            bone_indices.len(),
+            bone_indices.len() / 4
+        );
+    }
+}
+
+#[allow(dead_code)]
 fn handle_skin_info<H: SkinHeaderT + Clone>(path: PathBuf, detailed: bool) -> Result<()> {
     println!("Loading Skin file: {}", path.display());
 
@@ -734,16 +1151,35 @@ fn handle_skin_info<H: SkinHeaderT + Clone>(path: PathBuf, detailed: bool) -> Re
 fn handle_skin_convert(input: PathBuf, output: PathBuf, version_str: String) -> Result<()> {
     println!("Loading Skin file: {}", input.display());
 
-    let skin = Skin::load(&input)
+    // Use SkinFile::load() for automatic format detection
+    let skin = SkinFile::load(&input)
         .with_context(|| format!("Failed to load Skin file from {}", input.display()))?;
+
+    let source_format = if skin.is_new_format() {
+        "new format"
+    } else {
+        "old format"
+    };
+    println!("Detected source format: {}", source_format);
 
     let target_version = M2Version::from_expansion_name(&version_str)
         .with_context(|| format!("Invalid target version: {version_str}"))?;
 
-    println!("Converting to {target_version:?}");
+    let target_format = if target_version.uses_new_skin_format() {
+        "new format"
+    } else {
+        "old format"
+    };
+    println!("Converting to {:?} ({})...", target_version, target_format);
+
+    // Actually perform the conversion
+    let converted = skin
+        .convert(target_version)
+        .with_context(|| format!("Failed to convert skin to {:?}", target_version))?;
 
     println!("Saving converted Skin file to: {}", output.display());
-    skin.save(&output)
+    converted
+        .save(&output)
         .with_context(|| format!("Failed to save converted Skin file to {}", output.display()))?;
 
     println!("Conversion complete!");
